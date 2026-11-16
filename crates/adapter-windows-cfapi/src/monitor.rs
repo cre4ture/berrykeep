@@ -1819,14 +1819,7 @@ fn snapshot_entry_with_placeholder_state(
             (identity, state, None)
         }
         Some(Err(error))
-            if !attribute_placeholder
-                && (error_chain_has_win32_hresult(
-                    &error,
-                    windows_sys::Win32::Foundation::ERROR_NOT_A_CLOUD_FILE,
-                ) || error_chain_has_win32_hresult(
-                    &error,
-                    windows_sys::Win32::Foundation::ERROR_CLOUD_FILE_NOT_UNDER_SYNC_ROOT,
-                )) =>
+            if ordinary_probe_failure_for_root(&error, attribute_placeholder, sync_root) =>
         {
             (None, None, None)
         }
@@ -1862,6 +1855,46 @@ fn snapshot_entry_with_placeholder_state(
             })
             .flatten(),
     }
+}
+
+fn ordinary_probe_failure_for_root(
+    error: &anyhow::Error,
+    attribute_placeholder: bool,
+    root: &std::path::Path,
+) -> bool {
+    let registered = if !attribute_placeholder
+        && error_chain_has_win32_hresult(
+            error,
+            windows_sys::Win32::Foundation::ERROR_INVALID_FUNCTION,
+        ) {
+        crate::sync_root_identity::load_registered_sync_root_context(root)
+            .ok()
+            .map(|context| context.is_some())
+    } else {
+        None
+    };
+    probe_error_is_ordinary(error, attribute_placeholder, registered)
+}
+
+fn probe_error_is_ordinary(
+    error: &anyhow::Error,
+    attribute_placeholder: bool,
+    root_registered: Option<bool>,
+) -> bool {
+    if attribute_placeholder {
+        return false;
+    }
+    error_chain_has_win32_hresult(
+        error,
+        windows_sys::Win32::Foundation::ERROR_NOT_A_CLOUD_FILE,
+    ) || error_chain_has_win32_hresult(
+        error,
+        windows_sys::Win32::Foundation::ERROR_CLOUD_FILE_NOT_UNDER_SYNC_ROOT,
+    ) || (root_registered == Some(false)
+        && error_chain_has_win32_hresult(
+            error,
+            windows_sys::Win32::Foundation::ERROR_INVALID_FUNCTION,
+        ))
 }
 
 fn summarize_dehydrate_scan(entries: &HashMap<String, ObservedEntry>) -> DehydrateScanSummary {
@@ -1934,6 +1967,21 @@ mod tests {
         CF_IN_SYNC_STATE_NOT_IN_SYNC, CF_PIN_STATE_PINNED, CF_PIN_STATE_UNSPECIFIED,
     };
     use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_WRITE};
+
+    #[test]
+    fn invalid_function_probe_is_ordinary_only_with_negative_hint_and_unregistered_root() {
+        let error =
+            crate::helpers::hresult_nonneg(0x80070001_u32 as i32, "injected ordinary file probe")
+                .unwrap_err();
+        assert!(probe_error_is_ordinary(&error, false, Some(false)));
+        assert!(!probe_error_is_ordinary(&error, true, Some(false)));
+        assert!(!probe_error_is_ordinary(&error, false, Some(true)));
+        assert!(!probe_error_is_ordinary(&error, false, None));
+        let sharing =
+            crate::helpers::hresult_nonneg(0x80070020_u32 as i32, "injected sharing failure")
+                .unwrap_err();
+        assert!(!probe_error_is_ordinary(&sharing, false, Some(false)));
+    }
 
     #[derive(Default)]
     struct MockUploader {
