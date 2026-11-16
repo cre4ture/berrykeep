@@ -20,3 +20,12 @@ Namespace identity, content availability, and local modifications are separate
 concepts. A placeholder can satisfy metadata availability while an eager folder
 download requires complete contents. CFAPI hydration requests retain their own
 deadline-sensitive callback workers.
+
+The folder agent journals remote materialization in `sync-work.sqlite` next to
+its baseline. Continuous sync executes at most 64 jobs per pass and retries on
+a one-second timer without waiting for another remote change. One-shot sync
+drains ready work and returns an error if a transfer fails. Pending startup
+preservation decisions and local file/subtree fingerprints survive restart;
+changed local bytes become conflicts instead of being overwritten on retry.
+Folder uploads and remote mutations still use their existing path-based runtime;
+this integration does not change that protocol to object-ID mutations.

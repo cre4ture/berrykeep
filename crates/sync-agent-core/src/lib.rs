@@ -27,13 +27,13 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 use sync_core::{EntryKind, SyncSnapshot};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum LocalEntryKind {
     File,
     Directory,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LocalEntryState {
     pub kind: LocalEntryKind,
     pub size_bytes: u64,
