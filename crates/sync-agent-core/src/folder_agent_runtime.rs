@@ -34,6 +34,7 @@ use crate::{
 };
 
 mod materialization;
+#[cfg(test)]
 use materialization::apply_remote_snapshot;
 
 pub type FolderAgentClientIdentityPersistence = fn(&ClientIdentityMaterial) -> Result<()>;
@@ -653,6 +654,7 @@ struct RemoteApplyOutcome {
     ensured_directory_count: usize,
     downloaded_file_count: usize,
     removed_local_path_count: usize,
+    completed_work_count: usize,
 }
 
 impl RemoteApplyOutcome {
@@ -661,6 +663,7 @@ impl RemoteApplyOutcome {
         self.ensured_directory_count += other.ensured_directory_count;
         self.downloaded_file_count += other.downloaded_file_count;
         self.removed_local_path_count += other.removed_local_path_count;
+        self.completed_work_count += other.completed_work_count;
     }
 }
 
@@ -718,6 +721,7 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
         ),
         None => StartupStateStore::new(&state_identity_root, &scope, &connection_target),
     };
+    let materialization_journal = materialization::open(&state_store)?;
     let modification_log_store = match options.state_root_dir.as_deref() {
         Some(state_root_dir) => ModificationLogStore::new_with_state_root(
             &state_identity_root,
@@ -995,7 +999,8 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
     let mut local_state = local_state_before_remote_sync;
     let mut remote_index = RemoteTreeIndex::default();
     let mut suppressed_uploads: BTreeMap<String, LocalEntryState> = BTreeMap::new();
-    let mut initial_remote_outcome = apply_remote_snapshot(
+    let mut initial_remote_outcome = materialization::apply_remote_snapshot_with_journal(
+        &materialization_journal,
         backend,
         options,
         &client,
@@ -1145,7 +1150,7 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
     initial_runtime_metrics.preserved_local_file_count = usize_to_u64(preserve_local_files.len());
     initial_runtime_metrics.startup_conflict_count = usize_to_u64(startup_conflicts.len());
     let initial_sync_message = materialization::status_message(
-        &state_store,
+        &materialization_journal,
         format!(
             "Initial sync complete: {} and {}",
             format_remote_apply_summary(initial_remote_outcome),
@@ -1215,7 +1220,7 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
     let remote_last_success = last_success_shared.clone();
     let remote_idle_message = "Watching for remote changes".to_owned();
     let remote_event_tx = runtime_event_tx.clone();
-    let mut latest_remote_snapshot = initial_snapshot.clone();
+
     let remote_thread = refresh_poller.spawn_fetcher_loop_with_fetch(
         remote_running,
         Some(initial_snapshot),
@@ -1259,7 +1264,7 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
         + steady_state_local_scan_interval(options, backend.local_watch_hints_available(options));
     let mut pending_local_scan_hint = false;
     let mut pending_remote_updates = Vec::new();
-    let mut next_materialization_retry = Instant::now();
+    let mut next_materialization_retry = materialization::next_deadline(&materialization_journal)?;
 
     while running.load(Ordering::SeqCst) {
         if !drain_runtime_events(
@@ -1272,9 +1277,9 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
 
         let mut baseline_dirty = false;
         let mut remote_updates_applied = false;
+        let mut remote_plan_changed = false;
         let mut combined_remote_outcome = RemoteApplyOutcome::default();
         for update in std::mem::take(&mut pending_remote_updates) {
-            latest_remote_snapshot = update.snapshot.clone();
             let mut remote_pending_metrics =
                 FolderAgentRuntimeMetrics::from_states(Some(&local_state), Some(&remote_index));
             remote_pending_metrics.changed_path_count = usize_to_u64(update.changed_paths.len());
@@ -1292,7 +1297,8 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
                 last_success_unix_ms,
                 None,
             );
-            combined_remote_outcome.accumulate(apply_remote_snapshot(
+            let progress = materialization::apply_remote_snapshot_with_journal(
+                &materialization_journal,
                 backend,
                 options,
                 &client,
@@ -1307,31 +1313,34 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
                 &mut remote_index,
                 Some(&modification_log_store),
                 Some(&remote_refresh_log_context),
-            )?);
-            remote_updates_applied = true;
+            )?;
+            remote_updates_applied |= progress.completed_work_count > 0;
+            remote_plan_changed = true;
+            combined_remote_outcome.accumulate(progress);
         }
 
-        if Instant::now() >= next_materialization_retry {
-            next_materialization_retry = Instant::now() + Duration::from_secs(1);
-            if materialization::pending(&state_store)? {
-                combined_remote_outcome.accumulate(apply_remote_snapshot(
-                    backend,
-                    options,
-                    &client,
-                    &latest_remote_snapshot,
-                    Some(&mut local_state),
-                    Some(&[]),
-                    None,
-                    None,
-                    Some(&state_store),
-                    &scope,
-                    &mut suppressed_uploads,
-                    &mut remote_index,
-                    Some(&modification_log_store),
-                    Some(&remote_refresh_log_context),
-                )?);
-                remote_updates_applied = true;
-            }
+        if next_materialization_retry.is_some_and(|deadline| Instant::now() >= deadline) {
+            let progress = materialization::drain_remote_work(
+                &materialization_journal,
+                backend,
+                options,
+                &client,
+                Some(&mut local_state),
+                Some(&state_store),
+                &scope,
+                &mut suppressed_uploads,
+                &mut remote_index,
+                Some(&modification_log_store),
+                Some(&remote_refresh_log_context),
+            )?;
+            remote_updates_applied |= progress.completed_work_count > 0;
+            combined_remote_outcome.accumulate(progress);
+        }
+        if remote_plan_changed
+            || remote_updates_applied
+            || next_materialization_retry.is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            next_materialization_retry = materialization::next_deadline(&materialization_journal)?;
         }
 
         if remote_updates_applied {
@@ -1341,7 +1350,7 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
                 &suppressed_uploads,
                 None,
             );
-            baseline_dirty = true;
+            // Remote handlers persist successful path baselines incrementally.
             let local_scan_deadline = Instant::now()
                 + steady_state_local_scan_interval(
                     options,
@@ -1372,7 +1381,7 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
                 "steady-state",
                 "watching-for-changes",
                 materialization::status_message(
-                    &state_store,
+                    &materialization_journal,
                     format!(
                         "Applied remote changes: {}",
                         format_remote_apply_summary(combined_remote_outcome)
@@ -1505,7 +1514,10 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
                 "steady-state",
                 "watching-for-changes",
                 if local_sync_outcome.is_empty() {
-                    materialization::status_message(&state_store, idle_watch_message.clone())?
+                    materialization::status_message(
+                        &materialization_journal,
+                        idle_watch_message.clone(),
+                    )?
                 } else {
                     backend.watch_after_local_sync_message(
                         options,
@@ -1529,7 +1541,8 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
             && !wait_for_runtime_event(
                 &runtime_event_rx,
                 running.as_ref(),
-                next_local_scan.min(next_materialization_retry),
+                next_materialization_retry
+                    .map_or(next_local_scan, |deadline| next_local_scan.min(deadline)),
                 &mut pending_remote_updates,
                 &mut pending_local_scan_hint,
             )
@@ -3323,6 +3336,7 @@ mod tests {
         fail_download_for: Option<String>,
         fail_remove: bool,
         fingerprints: BTreeMap<String, String>,
+        scan_count: usize,
     }
 
     impl RecordingBackend {
@@ -3356,6 +3370,7 @@ mod tests {
             _options: &FolderAgentRuntimeOptions,
             _on_progress: &mut dyn FnMut(&LocalTreeScanProgress),
         ) -> Result<LocalTreeState> {
+            self.scan_count += 1;
             Ok(self.local_entries.clone())
         }
 
@@ -4243,6 +4258,310 @@ mod tests {
             result.is_err(),
             "one-shot sync must not advertise completion while another lease still owns unfinished work"
         );
+    }
+
+    #[test]
+    fn retry_never_derives_deletion_or_discards_a_locally_uploaded_path() {
+        let root = crate::test_support::test_root();
+        let scope = PathScope::new(None);
+        let journal = crate::sync_work::WorkStore::open(root.join("work.sqlite")).unwrap();
+        let snapshot = SyncSnapshot {
+            local: Vec::new(),
+            remote: vec![sync_core::NamespaceEntry::file(
+                "pending.txt",
+                "r1",
+                "remote",
+            )],
+        };
+        let mut backend = RecordingBackend::with_download_failure("pending.txt");
+        let mut options = test_runtime_options();
+        options.run_once = false;
+        let client = BerryKeepClient::from_direct_base_url("http://127.0.0.1:1");
+        let mut index = RemoteTreeIndex::default();
+        let mut suppressed = BTreeMap::new();
+        apply_remote_snapshot_with_journal(
+            &journal,
+            &mut backend,
+            &options,
+            &client,
+            &snapshot,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &scope,
+            &mut suppressed,
+            &mut index,
+            None,
+            None,
+        )
+        .unwrap();
+        let uploaded = LocalEntryState {
+            kind: LocalEntryKind::File,
+            size_bytes: 10,
+            modified_unix_ms: 2,
+        };
+        backend
+            .local_entries
+            .insert("new.txt".into(), uploaded.clone());
+        index.files.insert("new.txt".into());
+        let mut local_state = LocalTreeState::from([("new.txt".into(), uploaded.clone())]);
+        let outcome = apply_remote_snapshot_with_journal(
+            &journal,
+            &mut backend,
+            &options,
+            &client,
+            &snapshot,
+            Some(&mut local_state),
+            Some(&[]),
+            None,
+            None,
+            None,
+            &scope,
+            &mut suppressed,
+            &mut index,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            backend.local_entries.get("new.txt"),
+            Some(&uploaded),
+            "retry may not reinterpret absence in an older snapshot as remote deletion"
+        );
+        assert!(
+            index.files.contains("new.txt"),
+            "upload provenance must remain for a later genuine local delete"
+        );
+        assert_eq!(
+            outcome.changed_path_count, 0,
+            "a backed-off retry must not report progress"
+        );
+        // A later real local deletion must still reach the remote executor.
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(5)))
+                            .unwrap();
+                        let mut bytes = [0; 8192];
+                        let count = stream.read(&mut bytes).unwrap();
+                        stream.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                        return String::from_utf8_lossy(&bytes[..count]).into_owned();
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10))
+                    }
+                    Err(error) => panic!("test listener failed: {error}"),
+                }
+            }
+            panic!("expected the genuine user delete to reach the server");
+        });
+        backend.local_entries.remove("new.txt");
+        let deleted = sync_local_changes(
+            &mut backend,
+            &options,
+            &BerryKeepClient::from_direct_base_url(&endpoint),
+            &mut local_state,
+            None,
+            &scope,
+            &mut index,
+            &mut suppressed,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(deleted.deleted_remote_file_count, 1);
+        assert!(server.join().unwrap().contains("new.txt"));
+    }
+
+    #[test]
+    fn unrelated_snapshot_does_not_rearm_completed_remote_creation_after_local_delete() {
+        let root = crate::test_support::test_root();
+        let scope = PathScope::new(None);
+        let journal = crate::sync_work::WorkStore::open(root.join("work.sqlite")).unwrap();
+        let mut snapshot = SyncSnapshot {
+            local: Vec::new(),
+            remote: vec![sync_core::NamespaceEntry::file("a.txt", "r1", "remote")],
+        };
+        let mut backend = RecordingBackend::default();
+        let mut options = test_runtime_options();
+        options.run_once = false;
+        let client = BerryKeepClient::from_direct_base_url("http://127.0.0.1:1");
+        let mut index = RemoteTreeIndex::default();
+        let mut suppressed = BTreeMap::new();
+        apply_remote_snapshot_with_journal(
+            &journal,
+            &mut backend,
+            &options,
+            &client,
+            &snapshot,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &scope,
+            &mut suppressed,
+            &mut index,
+            None,
+            None,
+        )
+        .unwrap();
+        backend.local_entries.remove("a.txt");
+        snapshot.remote.push(sync_core::NamespaceEntry::file(
+            "unrelated.txt",
+            "r1",
+            "remote",
+        ));
+        apply_remote_snapshot_with_journal(
+            &journal,
+            &mut backend,
+            &options,
+            &client,
+            &snapshot,
+            None,
+            Some(&["unrelated.txt".into()]),
+            None,
+            None,
+            None,
+            &scope,
+            &mut suppressed,
+            &mut index,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(
+            !backend.local_entries.contains_key("a.txt"),
+            "unchanged completed desired state cannot recreate a local deletion"
+        );
+    }
+
+    #[test]
+    fn ensuring_an_existing_directory_allows_offline_child_changes() {
+        let root = crate::test_support::test_root();
+        let scope = PathScope::new(None);
+        let state =
+            StartupStateStore::new_with_state_root(&root, &scope, "server", &root.join("state"));
+        state
+            .upsert_baseline_entry(
+                "docs",
+                &LocalEntryState {
+                    kind: LocalEntryKind::Directory,
+                    size_bytes: 0,
+                    modified_unix_ms: 1,
+                },
+            )
+            .unwrap();
+        let mut backend = RecordingBackend::default();
+        backend.local_entries.insert(
+            "docs".into(),
+            LocalEntryState {
+                kind: LocalEntryKind::Directory,
+                size_bytes: 0,
+                modified_unix_ms: 99,
+            },
+        );
+        backend.local_entries.insert(
+            "docs/local.txt".into(),
+            LocalEntryState {
+                kind: LocalEntryKind::File,
+                size_bytes: 7,
+                modified_unix_ms: 99,
+            },
+        );
+        let journal = crate::sync_work::WorkStore::open(root.join("work.sqlite")).unwrap();
+        let snapshot = SyncSnapshot {
+            local: Vec::new(),
+            remote: vec![sync_core::NamespaceEntry::directory("docs")],
+        };
+        apply_remote_snapshot_with_journal(
+            &journal,
+            &mut backend,
+            &test_runtime_options(),
+            &BerryKeepClient::from_direct_base_url("http://127.0.0.1:1"),
+            &snapshot,
+            None,
+            None,
+            None,
+            None,
+            Some(&state),
+            &scope,
+            &mut BTreeMap::new(),
+            &mut RemoteTreeIndex::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(backend.local_entries.contains_key("docs/local.txt"));
+        assert_eq!(
+            journal.status("folder-materialization").unwrap().conflicts,
+            0
+        );
+    }
+
+    #[test]
+    fn deleting_many_directories_captures_each_tree_only_once_per_batch() {
+        let root = crate::test_support::test_root();
+        let scope = PathScope::new(None);
+        let journal = crate::sync_work::WorkStore::open(root.join("work.sqlite")).unwrap();
+        let mut backend = RecordingBackend::default();
+        let mut index = RemoteTreeIndex::default();
+        let mut changed = Vec::new();
+        for number in 0..20 {
+            let path = format!("dir-{number:02}");
+            changed.push(path.clone());
+            index.directories.insert(path.clone());
+            backend.local_entries.insert(
+                path.clone(),
+                LocalEntryState {
+                    kind: LocalEntryKind::Directory,
+                    size_bytes: 0,
+                    modified_unix_ms: 1,
+                },
+            );
+            backend.local_entries.insert(
+                format!("{path}/a.txt"),
+                LocalEntryState {
+                    kind: LocalEntryKind::File,
+                    size_bytes: 7,
+                    modified_unix_ms: 1,
+                },
+            );
+        }
+        apply_remote_snapshot_with_journal(
+            &journal,
+            &mut backend,
+            &test_runtime_options(),
+            &BerryKeepClient::from_direct_base_url("http://127.0.0.1:1"),
+            &SyncSnapshot::default(),
+            None,
+            Some(&changed),
+            None,
+            None,
+            None,
+            &scope,
+            &mut BTreeMap::new(),
+            &mut index,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            backend.scan_count, 2,
+            "one capture for scheduling and one for execution, independent of directory count"
+        );
+        assert!(backend.local_entries.is_empty());
     }
 
     #[test]

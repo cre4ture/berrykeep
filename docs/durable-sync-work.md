@@ -22,13 +22,27 @@ download requires complete contents. CFAPI hydration requests retain their own
 deadline-sensitive callback workers.
 
 The folder agent journals remote materialization in `sync-work.sqlite` next to
-its baseline. Continuous sync executes at most 64 jobs per pass and retries on
-a one-second timer without waiting for another remote change. One-shot sync
+its baseline. Continuous sync executes at most 64 jobs per pass and retries at
+the journal's next eligible deadline without waiting for another remote change.
+An empty journal does not add a retry timer. One-shot sync
 drains ready work and returns an error if a transfer fails. Pending startup
 preservation decisions and local file/subtree fingerprints survive restart;
 changed local bytes become conflicts instead of being overwritten on retry.
 Folder uploads and remote mutations still use their existing path-based runtime;
 this integration does not change that protocol to object-ID mutations.
+
+Authoritative snapshots schedule folder work; retry passes only drain persisted
+jobs. They never infer deletions from a cached snapshot or replace upload-known
+remote state. Unchanged completed jobs retain their original payload, so an
+unrelated remote update cannot recreate a local deletion before it is observed.
+Successful per-path baselines are persisted incrementally; backed-off work does
+not refresh the last-success timestamp or rewrite the whole baseline.
+
+Dependency readiness is normalized into indexed due-work rows. Blocked descendants
+and completed rows are absent from the claim index. Terminal history outside the
+current desired plan can be pruned while retaining active prerequisites and current
+desired completions. Directory preconditions share one tree capture per planning
+or execution batch rather than walking the entire root for every directory.
 
 CFAPI uses the same journal under its local application-data sync-root state,
 scoped by provider instance, connection target, and remote prefix. Startup first

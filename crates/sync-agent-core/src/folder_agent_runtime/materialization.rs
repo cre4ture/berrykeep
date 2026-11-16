@@ -27,6 +27,7 @@ struct FolderWork {
     baseline_conflict: bool,
 }
 
+#[cfg(test)]
 fn journal(state: Option<&StartupStateStore>) -> Result<WorkStore> {
     match state {
         Some(state) => WorkStore::open(state.path.with_file_name("sync-work.sqlite")),
@@ -35,13 +36,25 @@ fn journal(state: Option<&StartupStateStore>) -> Result<WorkStore> {
     }
 }
 
-pub(super) fn pending(state: &StartupStateStore) -> Result<bool> {
-    let status = journal(Some(state))?.status(SCOPE)?;
-    Ok(status.pending != 0 || status.running != 0)
+pub(super) fn open(state: &StartupStateStore) -> Result<WorkStore> {
+    let journal = WorkStore::open(state.path.with_file_name("sync-work.sqlite"))?;
+    journal.prune(now_ms(), 7 * 24 * 60 * 60 * 1000)?;
+    Ok(journal)
 }
 
-pub(super) fn status_message(state: &StartupStateStore, fallback: String) -> Result<String> {
-    let status = journal(Some(state))?.status(SCOPE)?;
+pub(super) fn next_deadline(journal: &WorkStore) -> Result<Option<Instant>> {
+    if let Some(at) = journal.next_ready_at(SCOPE)? {
+        return Ok(Some(
+            Instant::now() + Duration::from_millis(at.saturating_sub(now_ms()).max(0) as u64),
+        ));
+    }
+    // Existing shutdown polling supplies a bounded wake while conflicts await an
+    // explicit resolution from another connection; empty journals have no timer.
+    Ok((journal.status(SCOPE)?.conflicts > 0).then(|| Instant::now() + Duration::from_secs(1)))
+}
+
+pub(super) fn status_message(journal: &WorkStore, fallback: String) -> Result<String> {
+    let status = journal.status(SCOPE)?;
     let remaining = status.pending + status.running;
     Ok(if remaining > 0 || status.conflicts > 0 {
         format!(
@@ -87,17 +100,8 @@ pub(super) fn folder_materialization_plan(
             }
         }
     }
-    // Pending creations removed by a later snapshot must not be replayed.
-    // Remove any already materialized part through the normal guarded delete path.
-    for path in previous_index
-        .files
-        .iter()
-        .chain(previous_index.directories.iter())
-    {
-        if !entries.contains_key(path) {
-            selected.insert(path.clone(), false);
-        }
-    }
+    // Only explicit remote diffs authorize deletion. The mutable upload-known
+    // index is not proof of absence in an authoritative remote namespace.
     let mut work_by_path = BTreeMap::new();
     for (path, startup) in selected {
         let entry = entries.get(&path).cloned().or_else(|| {
@@ -152,6 +156,7 @@ pub(super) fn folder_materialization_plan(
     Ok(work_by_path.into_values().collect())
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn apply_remote_snapshot<B: FolderAgentLocalBackend>(
     backend: &mut B,
@@ -196,7 +201,7 @@ pub(super) fn apply_remote_snapshot_with_journal<B: FolderAgentLocalBackend>(
     options: &FolderAgentRuntimeOptions,
     client: &BerryKeepClient,
     snapshot: &SyncSnapshot,
-    mut local_state: Option<&mut LocalTreeState>,
+    local_state: Option<&mut LocalTreeState>,
     changed_paths: Option<&[String]>,
     preserve_local_files: Option<&BTreeSet<String>>,
     matching_remote_files: Option<&BTreeSet<String>>,
@@ -207,10 +212,68 @@ pub(super) fn apply_remote_snapshot_with_journal<B: FolderAgentLocalBackend>(
     modification_log: Option<&ModificationLogStore>,
     modification_context: Option<&ModificationLogContext>,
 ) -> Result<RemoteApplyOutcome> {
-    let pending = journal.work(SCOPE)?;
+    if changed_paths.is_none_or(|paths| !paths.is_empty()) {
+        schedule_remote_snapshot(
+            journal,
+            backend,
+            options,
+            snapshot,
+            changed_paths,
+            preserve_local_files,
+            state_store,
+            scope,
+            remote_index,
+        )?;
+    }
+    let outcome = drain_remote_work(
+        journal,
+        backend,
+        options,
+        client,
+        local_state,
+        state_store,
+        scope,
+        suppressed_uploads,
+        remote_index,
+        modification_log,
+        modification_context,
+    )?;
+    update_remote_index(snapshot, changed_paths, scope, remote_index);
+    let _ = matching_remote_files;
+    Ok(outcome)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn schedule_remote_snapshot<B: FolderAgentLocalBackend>(
+    journal: &WorkStore,
+    backend: &mut B,
+    options: &FolderAgentRuntimeOptions,
+    snapshot: &SyncSnapshot,
+    changed_paths: Option<&[String]>,
+    preserve_local_files: Option<&BTreeSet<String>>,
+    state_store: Option<&StartupStateStore>,
+    scope: &PathScope,
+    remote_index: &RemoteTreeIndex,
+) -> Result<()> {
+    let active = journal.work(SCOPE)?;
+    let all = journal.all_work(SCOPE)?;
+    let mut pending = all
+        .iter()
+        .filter(|job| {
+            job.payload
+                .get("entry")
+                .is_some_and(|entry| !entry.is_null())
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    pending.extend(
+        active
+            .into_iter()
+            .filter(|job| job.payload.get("entry").is_none_or(|entry| entry.is_null())),
+    );
     let mut work =
         folder_materialization_plan(snapshot, scope, changed_paths, remote_index, &pending)?;
-    let previous = pending
+    let previous = all
         .into_iter()
         .map(|item| (item.key, item.payload))
         .collect::<BTreeMap<_, _>>();
@@ -221,18 +284,15 @@ pub(super) fn apply_remote_snapshot_with_journal<B: FolderAgentLocalBackend>(
         .map(StartupStateStore::load_local_baseline_hashes)
         .transpose()?
         .unwrap_or_default();
+    let mut captured_tree = None;
+    let mut fingerprints: BTreeMap<String, String> = BTreeMap::new();
     for item in &mut work {
         let mut payload: FolderWork = serde_json::from_value(item.payload.clone())?;
         if let Some(previous) = previous.get(&item.key) {
             let previous: FolderWork = serde_json::from_value(previous.clone())?;
             if previous.entry == payload.entry {
-                payload.initial_local = previous.initial_local;
-                payload.precondition_recorded = previous.precondition_recorded;
-                payload.preserve = previous.preserve;
-                payload.remote_known |= previous.remote_known;
-                payload.initial_fingerprint = previous.initial_fingerprint;
-                payload.subtree = previous.subtree;
-                payload.baseline_conflict = previous.baseline_conflict;
+                item.payload = serde_json::to_value(previous)?;
+                continue;
             }
         }
         if !payload.precondition_recorded {
@@ -255,13 +315,24 @@ pub(super) fn apply_remote_snapshot_with_journal<B: FolderAgentLocalBackend>(
                     .is_none_or(|entry| entry.kind != EntryKind::Directory)
             {
                 let prefix = format!("{}/", payload.path);
-                let tree = scan_local_tree_without_status(backend, options)?;
-                for (path, state) in tree
-                    .into_iter()
-                    .filter(|(path, _)| path.starts_with(&prefix))
+                if captured_tree.is_none() {
+                    captured_tree = Some(scan_local_tree_without_status(backend, options)?);
+                }
+                for (path, state) in captured_tree
+                    .as_ref()
+                    .expect("captured tree")
+                    .range(prefix.clone()..)
+                    .take_while(|(path, _)| path.starts_with(&prefix))
+                    .map(|(path, state)| (path.clone(), state.clone()))
                 {
                     let fingerprint = if state.kind == LocalEntryKind::File {
-                        Some(backend.file_content_fingerprint(options, &path)?)
+                        Some(if let Some(hash) = fingerprints.get(&path) {
+                            hash.clone()
+                        } else {
+                            let hash = backend.file_content_fingerprint(options, &path)?;
+                            fingerprints.insert(path.clone(), hash.clone());
+                            hash
+                        })
                     } else {
                         None
                     };
@@ -272,24 +343,67 @@ pub(super) fn apply_remote_snapshot_with_journal<B: FolderAgentLocalBackend>(
             if let Some(baseline) = baseline.as_ref()
                 && let Some(current) = payload.initial_local.as_ref()
             {
-                let metadata_changed = baseline.get(&payload.path) != Some(current);
+                let same_kind_directory = current.kind == LocalEntryKind::Directory
+                    && payload
+                        .entry
+                        .as_ref()
+                        .is_some_and(|entry| entry.kind == EntryKind::Directory);
+                let metadata_changed =
+                    !same_kind_directory && baseline.get(&payload.path) != Some(current);
                 let content_changed = payload
                     .initial_fingerprint
                     .as_ref()
                     .is_some_and(|hash| baseline_hashes.get(&payload.path) != Some(hash));
                 let subtree_changed = payload.subtree.iter().any(|(path, (state, hash))| {
-                    baseline.get(path) != Some(state)
-                        || hash
-                            .as_ref()
-                            .is_some_and(|hash| baseline_hashes.get(path) != Some(hash))
+                    (if state.kind == LocalEntryKind::Directory {
+                        baseline
+                            .get(path)
+                            .is_none_or(|entry| entry.kind != LocalEntryKind::Directory)
+                    } else {
+                        baseline.get(path) != Some(state)
+                    }) || hash
+                        .as_ref()
+                        .is_some_and(|hash| baseline_hashes.get(path) != Some(hash))
                 });
                 payload.baseline_conflict = metadata_changed || content_changed || subtree_changed;
+            }
+        }
+        if payload.entry.is_some()
+            && let Some(baseline) = baseline.as_ref()
+        {
+            for parent in parent_directories(&payload.path) {
+                if baseline
+                    .get(&parent)
+                    .is_some_and(|entry| entry.kind == LocalEntryKind::Directory)
+                    && backend.local_entry_state(options, &parent)?.is_none()
+                {
+                    payload.baseline_conflict = true;
+                    break;
+                }
             }
         }
         payload.preserve |= preserve_local_files.is_some_and(|paths| paths.contains(&payload.path));
         item.payload = serde_json::to_value(payload)?;
     }
     journal.reconcile(SCOPE, &work)?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn drain_remote_work<B: FolderAgentLocalBackend>(
+    journal: &WorkStore,
+    backend: &mut B,
+    options: &FolderAgentRuntimeOptions,
+    client: &BerryKeepClient,
+    mut local_state: Option<&mut LocalTreeState>,
+    state_store: Option<&StartupStateStore>,
+    scope: &PathScope,
+    suppressed_uploads: &mut BTreeMap<String, LocalEntryState>,
+    remote_index: &mut RemoteTreeIndex,
+    modification_log: Option<&ModificationLogStore>,
+    modification_context: Option<&ModificationLogContext>,
+) -> Result<RemoteApplyOutcome> {
+    let mut current_tree = None;
     let mut outcome = RemoteApplyOutcome::default();
     let mut first_error = None;
     let limit = if options.run_once {
@@ -371,16 +485,29 @@ pub(super) fn apply_remote_snapshot_with_journal<B: FolderAgentLocalBackend>(
                         .is_none_or(|entry| entry.kind != EntryKind::Directory)
                 {
                     let prefix = format!("{}/", work.path);
-                    for (path, state) in scan_local_tree_without_status(backend, options)?
-                        .into_iter()
-                        .filter(|(path, _)| path.starts_with(&prefix))
+                    if current_tree.is_none() {
+                        current_tree = Some(scan_local_tree_without_status(backend, options)?);
+                    }
+                    for (path, state) in current_tree
+                        .as_ref()
+                        .expect("current tree")
+                        .range(prefix.clone()..)
+                        .take_while(|(path, _)| path.starts_with(&prefix))
+                        .map(|(path, state)| (path.clone(), state.clone()))
                     {
                         let fingerprint = if state.kind == LocalEntryKind::File {
                             Some(backend.file_content_fingerprint(options, &path)?)
                         } else {
                             None
                         };
-                        if work.subtree.get(&path) != Some(&(state, fingerprint)) {
+                        let changed = match work.subtree.get(&path) {
+                            Some((previous, _hash)) if state.kind == LocalEntryKind::Directory => {
+                                previous.kind != LocalEntryKind::Directory
+                            }
+                            Some((previous, hash)) => previous != &state || hash != &fingerprint,
+                            None => true,
+                        };
+                        if changed {
                             subtree_changed = true;
                             break;
                         }
@@ -393,7 +520,17 @@ pub(super) fn apply_remote_snapshot_with_journal<B: FolderAgentLocalBackend>(
                     && current
                         .as_ref()
                         .is_some_and(|entry| entry.kind == LocalEntryKind::Directory);
-                if (current.as_ref() != expected || file_changed || subtree_changed)
+                let same_directory =
+                    current
+                        .as_ref()
+                        .zip(expected)
+                        .is_some_and(|(current, expected)| {
+                            current.kind == LocalEntryKind::Directory
+                                && expected.kind == LocalEntryKind::Directory
+                        });
+                if ((current.as_ref() != expected && !same_directory)
+                    || file_changed
+                    || subtree_changed)
                     && !already_directory
                     && !(work.entry.is_none() && current.is_none())
                 {
@@ -427,8 +564,8 @@ pub(super) fn apply_remote_snapshot_with_journal<B: FolderAgentLocalBackend>(
                     &item_snapshot,
                     local_state.as_deref_mut(),
                     if work.startup { None } else { Some(&changed) },
-                    preserve_local_files,
-                    matching_remote_files,
+                    None,
+                    None,
                     state_store,
                     scope,
                     suppressed_uploads,
@@ -459,13 +596,27 @@ pub(super) fn apply_remote_snapshot_with_journal<B: FolderAgentLocalBackend>(
             }
         })?;
         if !applied {
-            anyhow::bail!(
-                "remote materialization generation was superseded while executing {}",
-                work.path
+            tracing::warn!(
+                path = work.path,
+                "remote work lease was superseded; retaining earlier progress and deferring replay"
             );
+            continue;
         }
         if matches!(result, WorkResult::Complete) {
+            item_outcome.completed_work_count = 1;
             outcome.accumulate(item_outcome);
+            if let Some(tree) = current_tree.as_mut() {
+                if work
+                    .entry
+                    .as_ref()
+                    .is_none_or(|entry| entry.kind == EntryKind::File)
+                {
+                    remove_local_state_path_and_descendants(tree, &work.path);
+                }
+                if let Some(entry) = backend.local_entry_state(options, &work.path)? {
+                    tree.insert(work.path.clone(), entry);
+                }
+            }
         }
     }
     if options.run_once
@@ -473,20 +624,6 @@ pub(super) fn apply_remote_snapshot_with_journal<B: FolderAgentLocalBackend>(
     {
         return Err(error);
     }
-    *remote_index = crate::build_remote_index(snapshot);
-    // The shared index builder uses remote paths; folder profiles may select a prefix.
-    remote_index.files = remote_index
-        .files
-        .iter()
-        .filter_map(|path| scope.remote_to_local(path))
-        .filter(|path| !path.is_empty())
-        .collect();
-    remote_index.directories = remote_index
-        .directories
-        .iter()
-        .filter_map(|path| scope.remote_to_local(path))
-        .filter(|path| !path.is_empty())
-        .collect();
     let status = journal.status(SCOPE)?;
     if options.run_once && (status.pending != 0 || status.running != 0 || status.conflicts != 0) {
         anyhow::bail!(
@@ -504,4 +641,58 @@ pub(super) fn apply_remote_snapshot_with_journal<B: FolderAgentLocalBackend>(
         );
     }
     Ok(outcome)
+}
+
+fn update_remote_index(
+    snapshot: &SyncSnapshot,
+    changed: Option<&[String]>,
+    scope: &PathScope,
+    index: &mut RemoteTreeIndex,
+) {
+    if changed.is_none() {
+        let full = crate::build_remote_index(snapshot);
+        index.files = full
+            .files
+            .iter()
+            .filter_map(|path| scope.remote_to_local(path))
+            .filter(|path| !path.is_empty())
+            .collect();
+        index.directories = full
+            .directories
+            .iter()
+            .filter_map(|path| scope.remote_to_local(path))
+            .filter(|path| !path.is_empty())
+            .collect();
+        return;
+    }
+    let entries = snapshot
+        .remote
+        .iter()
+        .filter_map(|entry| {
+            scope
+                .remote_to_local(&entry.path)
+                .map(|path| (path, entry.kind))
+        })
+        .collect::<BTreeMap<_, _>>();
+    for path in changed
+        .into_iter()
+        .flatten()
+        .filter_map(|path| scope.remote_to_local(path))
+        .filter(|path| !path.is_empty())
+    {
+        match entries.get(&path) {
+            Some(EntryKind::File) => {
+                remove_remote_directory_subtree_from_index(index, &path);
+                index.files.insert(path);
+            }
+            Some(EntryKind::Directory) => {
+                index.files.remove(&path);
+                index.directories.insert(path);
+            }
+            None => {
+                index.files.remove(&path);
+                remove_remote_directory_subtree_from_index(index, &path);
+            }
+        }
+    }
 }
