@@ -213,7 +213,8 @@ jobs:
 
   web-smoke-tests:
     name: Web (${{ matrix.suite.label }})
-    runs-on: ubuntu-latest
+    # Playwright 1.58 does not support the Ubuntu 26.04 runner image.
+    runs-on: ubuntu-24.04
     needs: workspace-check
     timeout-minutes: 45
     strategy:
