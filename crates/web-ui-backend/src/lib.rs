@@ -60,6 +60,8 @@ const EMBEDDED_WEB_UI_SESSION_TTL: Duration = Duration::from_secs(15 * 60);
 #[cfg(test)]
 mod binary_stream_tests;
 mod bounded_body;
+#[cfg(test)]
+mod service_health_tests;
 mod web_service_gateway;
 
 #[derive(Clone, Default)]
@@ -513,6 +515,7 @@ pub fn router(config: WebUiConfig) -> Router {
             get(web_rendezvous).put(web_update_rendezvous),
         )
         .route("/rendezvous/refresh", post(web_refresh_rendezvous))
+        .route("/connection-services", get(web_connection_services))
         .route("/latency-test", post(web_latency_test))
         .route("/ping", get(web_ping));
 
@@ -594,6 +597,7 @@ pub fn router(config: WebUiConfig) -> Router {
             get(web_rendezvous).put(web_update_rendezvous),
         )
         .route("/api/rendezvous/refresh", post(web_refresh_rendezvous))
+        .route("/api/connection-services", get(web_connection_services))
         .route("/api/latency-test", post(web_latency_test))
         .route("/api/ping", get(web_ping));
 
@@ -1785,7 +1789,7 @@ fn merge_endpoint_statuses(
 fn build_rendezvous_probe_client(
     config: &WebRendezvousRuntimeConfig,
 ) -> Result<Option<RendezvousControlClient>> {
-    let rendezvous_urls = normalize_rendezvous_urls(&config.bootstrap.rendezvous_urls);
+    let rendezvous_urls = config.bootstrap.effective_rendezvous_urls()?;
     if rendezvous_urls.is_empty() {
         return Ok(None);
     }
@@ -4104,6 +4108,31 @@ async fn web_refresh_connection_routes(State(state): State<WebState>) -> impl In
         Json(sdk.refresh_connection_route_snapshot().await),
     )
         .into_response()
+}
+
+async fn web_connection_services(State(state): State<WebState>) -> Response {
+    let probe_client = {
+        let runtime = state.runtime.read().await;
+        match runtime.rendezvous.as_ref() {
+            Some(config) => build_rendezvous_probe_client(config),
+            None => Ok(runtime.sdk.rendezvous_client()),
+        }
+    };
+    let snapshot = match probe_client {
+        Ok(Some(client)) => client.probe_service_health().await,
+        Ok(None) => Ok(client_sdk::RendezvousServiceHealthSnapshot {
+            generated_at_unix_ms: unix_ts_ms(),
+            endpoints: Vec::new(),
+        }),
+        Err(error) => Err(error),
+    };
+    match snapshot {
+        Ok(snapshot) => ([(CACHE_CONTROL, "no-store")], Json(snapshot)).into_response(),
+        Err(error) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Cannot check connection services: {error:#}"),
+        ),
+    }
 }
 
 async fn web_refresh_rendezvous(State(state): State<WebState>) -> impl IntoResponse {

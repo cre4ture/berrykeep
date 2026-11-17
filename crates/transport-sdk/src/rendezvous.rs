@@ -28,6 +28,9 @@ use crate::relay::{
 use crate::relay_tunnel::{RelayTunnelAcceptRequest, RelayTunnelClient, RelayTunnelSession};
 use crate::relay_wake::{RelayWakeClient, RelayWakeRegistration};
 
+mod service_health;
+pub use service_health::{RendezvousServiceHealth, RendezvousServiceHealthSnapshot, ServiceHealth};
+
 const MAX_RENDEZVOUS_ERROR_RESPONSE_BYTES: usize = 1024;
 const MAX_CONCURRENT_RELAY_TICKET_REQUESTS_PER_ORIGIN: usize = 3;
 const MAX_SERVER_TICKET_BACKOFF: Duration = Duration::from_secs(5 * 60);
@@ -498,25 +501,7 @@ impl RendezvousControlClient {
     ) -> Result<Self> {
         config.validate()?;
 
-        let builder = Client::builder();
-        let builder = if let Some(server_ca_pem) = server_ca_pem {
-            builder.add_root_certificate(
-                Certificate::from_pem(server_ca_pem.as_bytes())
-                    .context("failed to parse rendezvous server CA certificate")?,
-            )
-        } else {
-            builder
-        };
-        let builder = if let Some(client_identity_pem) = client_identity_pem {
-            builder.identity(
-                reqwest::Identity::from_pem(client_identity_pem)
-                    .context("failed to parse rendezvous client identity PEM")?,
-            )
-        } else {
-            builder
-        };
-
-        let http = builder
+        let http = rendezvous_http_client_builder(server_ca_pem, client_identity_pem)?
             .build()
             .context("failed building rendezvous control HTTP client")?;
         Ok(Self {
@@ -1556,6 +1541,26 @@ fn default_heartbeat_interval_secs() -> u64 {
 
 fn normalized_endpoint_url(value: &str) -> String {
     value.trim().trim_end_matches('/').to_string()
+}
+
+fn rendezvous_http_client_builder(
+    server_ca_pem: Option<&str>,
+    client_identity_pem: Option<&[u8]>,
+) -> Result<reqwest::ClientBuilder> {
+    let mut builder = Client::builder();
+    if let Some(pem) = server_ca_pem {
+        builder = builder.add_root_certificate(
+            Certificate::from_pem(pem.as_bytes())
+                .context("failed to parse rendezvous server CA certificate")?,
+        );
+    }
+    if let Some(pem) = client_identity_pem {
+        builder = builder.identity(
+            reqwest::Identity::from_pem(pem)
+                .context("failed to parse rendezvous client identity PEM")?,
+        );
+    }
+    Ok(builder)
 }
 
 fn unix_timestamp() -> u64 {

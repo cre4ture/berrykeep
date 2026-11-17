@@ -462,6 +462,92 @@ async function androidShareMessages(page: Page): Promise<string[]> {
   );
 }
 
+test("client-ui service health remains independent of failed cluster routes", async ({ page }) => {
+  await installClientUiMocks(page);
+  await page.route(`**${apiV1("/connection-routes")}`, (route) =>
+    route.fulfill({ status: 503, json: { error: "No cluster connection" } })
+  );
+  let relayHealthy = false;
+  await page.route(`**${apiV1("/connection-services")}`, (route) =>
+    json(route, {
+      generated_at_unix_ms: 1_712_345_600_000,
+      endpoints: [{
+        rendezvous: {
+          url: "https://rendezvous-a.local:9443", status: "reachable",
+          checked_at_unix_ms: 1_712_345_600_000, latency_ms: 12,
+          http_status: 200, reported_status: "ok", software_version: "2.1.0", error: null
+        },
+        iroh_relays: [{
+          url: "https://iroh-relay.local:9443", status: relayHealthy ? "reachable" : "unhealthy",
+          checked_at_unix_ms: 1_712_345_600_000, latency_ms: 23,
+          http_status: relayHealthy ? 200 : 503, reported_status: null, software_version: null,
+          error: relayHealthy ? null : "HTTP 503 Service Unavailable"
+        }],
+        relay_discovery_error: null
+      }]
+    })
+  );
+  await page.goto("/");
+  await page.getByText("Connection paths", { exact: true }).click();
+  const services = page.getByRole("region", { name: "Rendezvous and iroh relay services" });
+  await expect(services.getByText("Reachable", { exact: true })).toHaveCount(1);
+  await expect(services.getByText("Unhealthy", { exact: true })).toHaveCount(1);
+  await expect(services.getByText("HTTP 503 Service Unavailable", { exact: true })).toBeVisible();
+  await expect(services.getByText("https://iroh-relay.local:9443", { exact: true })).toBeVisible();
+  await expect(services.getByText("Version 2.1.0", { exact: true })).toBeVisible();
+  relayHealthy = true;
+  await services.getByRole("button", { name: "Check services" }).click();
+  await expect(services.getByText("Reachable", { exact: true })).toHaveCount(2);
+  await expect(services.getByText("Unhealthy", { exact: true })).toHaveCount(0);
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect.poll(() => services.evaluate((node) => node.scrollWidth <= node.clientWidth)).toBe(true);
+});
+
+test("client-ui service health distinguishes unknown relay status from no advertised relay", async ({ page }) => {
+  await installClientUiMocks(page);
+  await page.route(`**${apiV1("/connection-services")}`, (route) => json(route, {
+    generated_at_unix_ms: 1_712_345_600_000,
+    endpoints: [null, "Rendezvous health request timed out"].map((error, index) => ({
+      rendezvous: {
+        url: `https://rendezvous-${index}.local`, status: error ? "unreachable" : "reachable",
+        checked_at_unix_ms: 1_712_345_600_000, latency_ms: 12,
+        http_status: error ? null : 200, reported_status: error ? null : "ok",
+        software_version: null, error
+      },
+      iroh_relays: [], relay_discovery_error: error
+    }))
+  }));
+  await page.goto("/");
+  await page.getByText("Connection paths", { exact: true }).click();
+  const services = page.getByRole("region", { name: "Rendezvous and iroh relay services" });
+  await expect(services.getByText("No iroh relay advertised", { exact: true })).toBeVisible();
+  await expect(services.getByText("iroh relay status unknown", { exact: true })).toBeVisible();
+  await expect(services.getByText("Unreachable", { exact: true })).toBeVisible();
+});
+
+test("client-ui service health polls independently and reports later API failures", async ({ page }) => {
+  await installClientUiMocks(page);
+  await page.clock.install();
+  let checkCount = 0;
+  let failCheck = false;
+  await page.route(`**${apiV1("/connection-services")}`, (route) => {
+    checkCount += 1;
+    return failCheck
+      ? route.fulfill({ status: 500, json: { error: "Cannot build diagnostic client" } })
+      : json(route, { generated_at_unix_ms: Date.now(), endpoints: [] });
+  });
+  await page.goto("/");
+  await page.getByText("Connection paths", { exact: true }).click();
+  const services = page.getByRole("region", { name: "Rendezvous and iroh relay services" });
+  await expect(services.getByText("No Rendezvous services configured.")).toBeVisible();
+  const initialCount = checkCount;
+  failCheck = true;
+  await page.clock.fastForward(30_000);
+  await expect.poll(() => checkCount).toBeGreaterThan(initialCount);
+  await expect(services.getByText("Service check failed", { exact: true })).toBeVisible();
+  await expect(services.getByText(/Showing previous check results/)).toBeVisible();
+});
+
 test("client-ui smoke flow renders and performs core operations", async ({ page }) => {
   test.setTimeout(75_000);
   await page.context().grantPermissions(["clipboard-read", "clipboard-write"], {
@@ -2692,6 +2778,10 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
           }
         ]
       });
+    }
+
+    if (pathname === apiV1("/connection-services") && method === "GET") {
+      return json(route, { generated_at_unix_ms: Date.now(), endpoints: [] });
     }
 
     if (pathname === apiV1("/rendezvous/refresh") && method === "POST") {

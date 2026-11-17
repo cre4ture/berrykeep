@@ -14,6 +14,7 @@ import type {
 import type {
   StoreIndexDeltaResponse,
   ClientConnectionRouteSnapshot,
+  ClientConnectionServicesSnapshot,
   ClientCacheContextResponse,
   ClientDeviceIdentityView,
   ClientDiagnosticLogExport,
@@ -155,6 +156,13 @@ export async function getClientClusterTaskQueues(
     apiV1("/cluster/task-queues"),
     diagnosticRequestInit(options)
   );
+}
+
+export async function getClientConnectionServices(signal?: AbortSignal): Promise<ClientConnectionServicesSnapshot> {
+  return fetchJson<ClientConnectionServicesSnapshot>(apiV1("/connection-services"), {
+    signal,
+    cache: "no-store"
+  });
 }
 
 export async function getClientConnectionRoutes(): Promise<ClientConnectionRouteSnapshot> {
