@@ -86,8 +86,12 @@ Implicit parent directories are derived from eligible children. A protected
 child deletion cannot recreate its empty implicit branch; explicit directory
 marker objects remain independently materializable.
 
-Deletes and moves retain object ID and expected revision. Accepted mutations
-leave revision fences so a snapshot fetched before replay cannot recreate or
+Deletes and moves retain object ID and expected revision. Pending moves
+track subsequent local moves by stable ID while their original rename remains
+pending; deleting a pending destination becomes a guarded delete of that same
+object. A complete topology pass enqueues child dependencies before replaying
+directory-marker removal. These updates retain the original revision precondition.
+Accepted mutations leave revision fences so a snapshot fetched before replay cannot recreate or
 revert the old revision. Newer remote restores remain eligible. Upload bytes
 still use the guarded CFAPI transfer executor; its shared uploader boundary
 journals upload intent and accepted receipts before returning success. Receipt

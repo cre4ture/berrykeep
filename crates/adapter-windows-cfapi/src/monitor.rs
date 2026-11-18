@@ -564,7 +564,7 @@ impl SyncRootMonitor {
         if snapshot.walk_error_count == 0 {
             self.work.cancel_missing_uploads(&current)?;
             let renamed = self.handle_local_object_renames(&mut current)?;
-            self.handle_deleted_entries(&current, &renamed)?;
+            self.handle_deleted_entries(&mut current, &renamed)?;
             self.prior_paths = current
                 .iter()
                 .map(|(path, entry)| {
@@ -751,7 +751,7 @@ impl SyncRootMonitor {
         self.log_dehydrate_scan_summary(dehydrate_summary);
         if walk_error_count == 0 {
             self.work.cancel_missing_uploads(&current)?;
-            self.handle_deleted_entries(&current, &handled_renames)?;
+            self.handle_deleted_entries(&mut current, &handled_renames)?;
             self.pending_uploads
                 .retain(|path| current.contains_key(path));
             self.unavailable_cfapi_inspections.retain(|path| {
@@ -832,6 +832,8 @@ impl SyncRootMonitor {
         &mut self,
         current: &mut HashMap<String, ObservedEntry>,
     ) -> anyhow::Result<HashSet<String>> {
+        self.work.reconcile_pending_renames(current)?;
+        let mut new_intents = Vec::new();
         for rename in detect_local_object_renames(&self.prior_paths, current) {
             tracing::debug!(
                 from = rename.from_path,
@@ -850,19 +852,29 @@ impl SyncRootMonitor {
                 revision: entry.placeholder_revision.clone().expect("rename revision"),
                 is_dir: entry.is_dir,
             };
-            self.work.enqueue_intent(&intent)?;
+            new_intents.push(intent);
         }
+        self.work.enqueue_intents(&new_intents)?;
         let intents = self.work.local_intents()?;
-        let handled = intents
+        let ids = intents
+            .iter()
+            .map(|intent| intent.object_id())
+            .collect::<HashSet<_>>();
+        let mut handled: HashSet<String> = intents
             .iter()
             .flat_map(|intent| intent.paths().into_iter().map(ToOwned::to_owned))
             .collect();
-        self.work.drain_mutations(self.uploader.as_ref())?;
-        for intent in intents {
-            if let work::LocalMutation::Rename { to, is_dir, .. } = intent {
-                self.seed_existing_entry(current, &to, is_dir);
-            }
-        }
+        handled.extend(
+            self.prior_paths
+                .iter()
+                .filter(|(_, prior)| {
+                    prior
+                        .object_id
+                        .as_deref()
+                        .is_some_and(|id| ids.contains(id))
+                })
+                .map(|(path, _)| path.clone()),
+        );
         Ok(handled)
     }
 
@@ -1534,7 +1546,7 @@ impl SyncRootMonitor {
 
     fn handle_deleted_entries(
         &self,
-        current: &HashMap<String, ObservedEntry>,
+        current: &mut HashMap<String, ObservedEntry>,
         handled_renames: &HashSet<String>,
     ) -> anyhow::Result<()> {
         let mut intents = Vec::new();
@@ -1560,13 +1572,21 @@ impl SyncRootMonitor {
             );
             intents.push(work::LocalMutation::Delete {
                 path: path.clone(),
+                renamed_from: None,
                 object_id: object_id.clone(),
                 revision: revision.clone(),
                 is_dir: entry.is_dir,
             });
         }
         self.work.enqueue_deletes(&intents)?;
-        self.work.drain_mutations(self.uploader.as_ref())
+        let intents = self.work.local_intents()?;
+        self.work.drain_mutations(self.uploader.as_ref())?;
+        for intent in intents {
+            if let work::LocalMutation::Rename { to, is_dir, .. } = intent {
+                self.seed_existing_entry(current, &to, is_dir);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -2993,7 +3013,8 @@ mod tests {
             PriorPath::from_observed(&observed_entry(false)),
         );
 
-        let current = HashMap::from([(String::from("docs/new-name.txt"), observed_entry(false))]);
+        let mut current =
+            HashMap::from([(String::from("docs/new-name.txt"), observed_entry(false))]);
         let handled_renames = HashSet::from([
             String::from("docs/old-name.txt"),
             String::from("docs/new-name.txt"),
@@ -3007,7 +3028,7 @@ mod tests {
         assert!(!monitor.prior_paths.contains_key("docs/old-name.txt"));
 
         monitor
-            .handle_deleted_entries(&current, &handled_renames)
+            .handle_deleted_entries(&mut current, &handled_renames)
             .unwrap();
 
         assert!(
@@ -3120,7 +3141,7 @@ mod tests {
             .insert("documents".to_string(), directory);
 
         monitor
-            .handle_deleted_entries(&HashMap::new(), &HashSet::new())
+            .handle_deleted_entries(&mut HashMap::new(), &HashSet::new())
             .unwrap();
 
         assert_eq!(
@@ -3187,6 +3208,96 @@ mod tests {
     }
 
     #[test]
+    fn pending_rename_tracks_a_second_move_or_delete_across_restart() {
+        struct ChainedUploader {
+            renames: Mutex<Vec<String>>,
+            deletes: Mutex<Vec<(String, String)>>,
+        }
+        impl Uploader for ChainedUploader {
+            fn upload_reader(
+                &self,
+                _: &str,
+                _: &mut dyn Read,
+                _: u64,
+            ) -> anyhow::Result<UploadReceipt> {
+                anyhow::bail!("unexpected content upload")
+            }
+            fn rename_object(
+                &self,
+                _: &str,
+                _: &str,
+                to: &str,
+            ) -> anyhow::Result<crate::runtime::ObjectRenameReceipt> {
+                self.renames.lock().unwrap().push(to.to_owned());
+                anyhow::bail!("temporary transport failure")
+            }
+            fn delete_object(&self, id: &str, rev: &str) -> anyhow::Result<()> {
+                self.deletes.lock().unwrap().push((id.into(), rev.into()));
+                Ok(())
+            }
+        }
+        for deleted in [false, true] {
+            let (sync_root, provider) = registered_monitor_test_sync_root("chained-local-rename");
+            create_clean_provider_placeholder(&sync_root.root_path, provider, "a.txt");
+            let state = std::env::temp_dir()
+                .join(format!("berrykeep-chain-state-{}", uuid::Uuid::new_v4()))
+                .join("work.sqlite");
+            let uploader = Arc::new(ChainedUploader {
+                renames: Mutex::default(),
+                deletes: Mutex::default(),
+            });
+            let mut monitor = SyncRootMonitor::from_store(
+                "test",
+                sync_root.root_path.clone(),
+                provider,
+                uploader.clone(),
+                sync_agent_core::sync_work::WorkStore::open(&state).unwrap(),
+            )
+            .unwrap();
+            monitor.prepare_startup().unwrap();
+            std::fs::rename(
+                sync_root.root_path.join("a.txt"),
+                sync_root.root_path.join("b.txt"),
+            )
+            .unwrap();
+            monitor.try_walk().unwrap();
+            assert_eq!(*uploader.renames.lock().unwrap(), vec!["b.txt"]);
+            drop(monitor);
+            if deleted {
+                std::fs::remove_file(sync_root.root_path.join("b.txt")).unwrap();
+            } else {
+                std::fs::rename(
+                    sync_root.root_path.join("b.txt"),
+                    sync_root.root_path.join("c.txt"),
+                )
+                .unwrap();
+            }
+            let mut reopened = SyncRootMonitor::from_store(
+                "test",
+                sync_root.root_path.clone(),
+                provider,
+                uploader.clone(),
+                sync_agent_core::sync_work::WorkStore::open(&state).unwrap(),
+            )
+            .unwrap();
+            reopened.prepare_startup().unwrap();
+            assert_eq!(reopened.work.status().unwrap().conflicts, 0);
+            if deleted {
+                assert_eq!(
+                    *uploader.deletes.lock().unwrap(),
+                    vec![("test-object".into(), "newer-revision".into())]
+                );
+                assert!(reopened.work.local_intents().unwrap().is_empty());
+            } else {
+                assert_eq!(*uploader.renames.lock().unwrap(), vec!["b.txt", "c.txt"]);
+                assert!(
+                    matches!(&reopened.work.local_intents().unwrap()[0], work::LocalMutation::Rename { from, to, revision, .. } if from == "a.txt" && to == "c.txt" && revision == "newer-revision")
+                );
+            }
+        }
+    }
+
+    #[test]
     fn transient_object_id_rename_failure_is_retried_after_topology_baseline_advances() {
         let (sync_root, provider) = registered_monitor_test_sync_root("durable-rename-retry");
         create_clean_provider_placeholder(&sync_root.root_path, provider, "docs/old.txt");
@@ -3206,6 +3317,9 @@ mod tests {
         .unwrap();
         let mut current = monitor.snapshot_entries().entries;
         let first_handled = monitor.handle_local_object_renames(&mut current).unwrap();
+        monitor
+            .handle_deleted_entries(&mut current, &first_handled)
+            .unwrap();
         assert!(first_handled.contains("docs/old.txt"));
         assert!(first_handled.contains("archive/new.txt"));
         assert_eq!(monitor.work.local_intents().unwrap().len(), 1);
@@ -3236,6 +3350,9 @@ mod tests {
             )
             .unwrap();
         let second_handled = monitor.handle_local_object_renames(&mut current).unwrap();
+        monitor
+            .handle_deleted_entries(&mut current, &second_handled)
+            .unwrap();
 
         assert!(second_handled.contains("docs/old.txt"));
         assert!(second_handled.contains("archive/new.txt"));

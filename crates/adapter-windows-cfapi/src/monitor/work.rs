@@ -35,6 +35,8 @@ struct RevisionFence {
 pub(super) enum LocalMutation {
     Delete {
         path: String,
+        #[serde(default)]
+        renamed_from: Option<String>,
         object_id: String,
         revision: String,
         is_dir: bool,
@@ -56,7 +58,11 @@ impl LocalMutation {
     }
     pub(super) fn paths(&self) -> Vec<&str> {
         match self {
-            Self::Delete { path, .. } => vec![path],
+            Self::Delete {
+                path, renamed_from, ..
+            } => std::iter::once(path.as_str())
+                .chain(renamed_from.as_deref())
+                .collect(),
             Self::Rename { from, to, .. } => vec![from, to],
         }
     }
@@ -492,22 +498,55 @@ impl CfapiWork {
             .collect())
     }
 
+    #[cfg(test)]
     pub(super) fn enqueue_intent(&self, intent: &LocalMutation) -> Result<()> {
-        self.store.enqueue(
-            LOCAL_SCOPE,
-            &[PlannedWork::new(
-                intent.object_id(),
-                intent.object_id(),
-                serde_json::to_value(intent)?,
-            )],
-        )?;
+        self.enqueue_intents(std::slice::from_ref(intent))
+    }
+
+    pub(super) fn enqueue_intents(&self, intents: &[LocalMutation]) -> Result<()> {
+        let jobs = intents
+            .iter()
+            .map(|intent| {
+                Ok(PlannedWork::new(
+                    intent.object_id(),
+                    intent.object_id(),
+                    serde_json::to_value(intent)?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.store.enqueue(LOCAL_SCOPE, &jobs)?;
         self.notify();
         Ok(())
     }
 
     pub(super) fn enqueue_deletes(&self, intents: &[LocalMutation]) -> Result<()> {
-        let mut jobs = Vec::new();
+        let existing = self.store.work(LOCAL_SCOPE)?;
+        let mut all = BTreeMap::new();
+        for job in &existing {
+            let intent: LocalMutation = serde_json::from_value(job.payload.clone())?;
+            if matches!(intent, LocalMutation::Delete { .. }) {
+                all.insert(intent.object_id().to_owned(), intent);
+            }
+        }
         for intent in intents {
+            all.insert(intent.object_id().to_owned(), intent.clone());
+        }
+        let intents = all.into_values().collect::<Vec<_>>();
+        let dependencies = existing
+            .iter()
+            .map(|job| (job.key.as_str(), &job.depends_on))
+            .collect::<HashMap<_, _>>();
+        let paths = intents
+            .iter()
+            .filter_map(|intent| match intent {
+                LocalMutation::Delete {
+                    path, object_id, ..
+                } => Some((path.clone(), object_id)),
+                _ => None,
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut jobs = Vec::new();
+        for intent in &intents {
             let mut job = PlannedWork::new(
                 intent.object_id(),
                 intent.object_id(),
@@ -518,21 +557,83 @@ impl CfapiWork {
             } = intent
             {
                 let prefix = format!("{path}/");
-                job.depends_on = intents
-                    .iter()
-                    .filter_map(|child| match child {
-                        LocalMutation::Delete {
-                            path, object_id, ..
-                        } if path.starts_with(&prefix) => Some(object_id.clone()),
-                        _ => None,
-                    })
-                    .collect();
+                job.depends_on = dependencies
+                    .get(job.key.as_str())
+                    .map(|deps| (*deps).clone())
+                    .unwrap_or_default();
+                job.depends_on.extend(
+                    paths
+                        .range(prefix.clone()..)
+                        .take_while(|(path, _)| path.starts_with(&prefix))
+                        .map(|(_, id)| (*id).clone())
+                        .collect::<Vec<_>>(),
+                );
+                job.depends_on.sort();
+                job.depends_on.dedup();
             }
             jobs.push(job);
         }
         self.store.enqueue(LOCAL_SCOPE, &jobs)?;
         self.notify();
         Ok(())
+    }
+
+    /// A complete topology scan can revise a pending destination by stable ID,
+    /// even while FileIdentity still contains the original source path.
+    pub(super) fn reconcile_pending_renames(
+        &self,
+        current: &HashMap<String, ObservedEntry>,
+    ) -> Result<()> {
+        let mut deletes = Vec::new();
+        let mut renames = Vec::new();
+        let mut by_id: HashMap<&str, Vec<(&String, &ObservedEntry)>> = HashMap::new();
+        let unknown_identity = current
+            .values()
+            .any(|entry| entry.placeholder_inspection_error.is_some());
+        for (path, entry) in current {
+            if let Some(id) = entry.placeholder_object_id.as_deref() {
+                by_id.entry(id).or_default().push((path, entry));
+            }
+        }
+        for intent in self.local_intents()? {
+            let LocalMutation::Rename {
+                from,
+                to,
+                object_id,
+                revision,
+                is_dir,
+            } = intent
+            else {
+                continue;
+            };
+            match by_id
+                .get(object_id.as_str())
+                .map(Vec::as_slice)
+                .unwrap_or_default()
+            {
+                [(path, entry)] if **path != to && entry.is_dir == is_dir => {
+                    renames.push(LocalMutation::Rename {
+                        from,
+                        to: (*path).clone(),
+                        object_id,
+                        revision,
+                        is_dir,
+                    });
+                }
+                [] if !current.contains_key(&to) && !unknown_identity => {
+                    deletes.push(LocalMutation::Delete {
+                        path: to,
+                        renamed_from: Some(from),
+                        object_id,
+                        revision,
+                        is_dir,
+                    });
+                }
+                _ => {}
+            }
+        }
+        self.enqueue_intents(&renames)?;
+        self.enqueue_deletes(&deletes)
     }
 
     pub(super) fn drain_mutations(&self, uploader: &dyn Uploader) -> Result<()> {
@@ -586,6 +687,11 @@ impl CfapiWork {
                 let full = self.root.join(path.replace('/', "\\"));
                 if full.exists() {
                     let entry = snapshot_entry(&self.root, path, &full, full.is_dir());
+                    if entry.placeholder_inspection_error.is_some() {
+                        return WorkResult::Retry(format!(
+                            "delete target identity unavailable at {path}"
+                        ));
+                    }
                     if entry.placeholder_object_id.as_deref() == Some(object_id) {
                         return WorkResult::Conflict(format!(
                             "deleted object was restored locally at {path}"
@@ -620,6 +726,11 @@ impl CfapiWork {
             } => {
                 let full = self.root.join(to.replace('/', "\\"));
                 let entry = snapshot_entry(&self.root, to, &full, *is_dir);
+                if entry.placeholder_inspection_error.is_some() {
+                    return WorkResult::Retry(format!(
+                        "rename destination identity unavailable at {to}"
+                    ));
+                }
                 if entry.placeholder_object_id.as_deref() != Some(object_id) {
                     return WorkResult::Conflict(format!(
                         "rename destination identity changed at {to}"
@@ -697,11 +808,15 @@ impl CfapiWork {
         inventory: &BTreeMap<String, BTreeSet<String>>,
     ) -> Result<()> {
         *self.inventory.lock().unwrap_or_else(|err| err.into_inner()) = inventory.clone();
+        let protected_ids = self.protected_object_ids()?;
         let plan = CfapiActionPlan {
             actions: plan
                 .actions
                 .iter()
-                .filter(|action| !self.suppressed_by_fence(action))
+                .filter(|action| {
+                    !self.suppressed_by_fence(action)
+                        && !action_object_id(action).is_some_and(|id| protected_ids.contains(id))
+                })
                 .cloned()
                 .collect(),
         };
@@ -1209,6 +1324,62 @@ mod tests {
         }
     }
     #[test]
+    fn deleting_pending_directory_rename_gates_marker_on_children_and_protects_original_ids() {
+        let work = CfapiWork::new(
+            root(),
+            uuid::Uuid::nil(),
+            WorkStore::open(":memory:").unwrap(),
+            RemoteAppliedTracker::default(),
+        )
+        .unwrap();
+        work.enqueue_intent(&LocalMutation::Rename {
+            from: "a".into(),
+            to: "b".into(),
+            object_id: "first-parent".into(),
+            revision: "r1".into(),
+            is_dir: true,
+        })
+        .unwrap();
+        work.reconcile_pending_renames(&HashMap::new()).unwrap();
+        assert!(
+            work.protected_paths().unwrap().contains("a"),
+            "converted directory deletion retains original source-subtree protection"
+        );
+        // A child may already have its own post-rename observation. It must be
+        // enqueued before replaying the parent's now-deleted destination.
+        work.enqueue_deletes(&[LocalMutation::Delete {
+            path: "b/child".into(),
+            renamed_from: None,
+            object_id: "z-child".into(),
+            revision: "r2".into(),
+            is_dir: false,
+        }])
+        .unwrap();
+        let next = work
+            .store
+            .claim_next(LOCAL_SCOPE, now_ms(), 120_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.work.key, "z-child");
+        work.schedule(
+            &CfapiActionPlan {
+                actions: vec![CfapiAction::EnsureDirectory {
+                    object_id: Some("first-parent".into()),
+                    path: "a".into(),
+                    remote_version: Some("r1".into()),
+                }],
+            },
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            work.store.status(MATERIALIZATION_SCOPE).unwrap().pending,
+            0,
+            "pending deletion by ID protects the original source even after local target changed"
+        );
+    }
+
+    #[test]
     fn implicit_parents_exist_only_for_eligible_children() {
         let plan = CfapiActionPlan {
             actions: vec![
@@ -1327,6 +1498,7 @@ mod tests {
         .unwrap();
         let intent = LocalMutation::Delete {
             path: "a.txt".into(),
+            renamed_from: None,
             object_id: "object-a.txt".into(),
             revision: "r1".into(),
             is_dir: false,
