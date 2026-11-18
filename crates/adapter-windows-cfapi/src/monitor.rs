@@ -4,6 +4,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+mod work;
+pub(crate) use work::CfapiWork;
+
 use crate::adapter::{CfapiAction, CfapiActionPlan};
 use crate::auth::is_internal_client_identity_relative_path;
 use crate::cfapi::{
@@ -100,7 +103,7 @@ impl ObservedEntry {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct PriorPath {
     is_dir: bool,
     object_id: Option<String>,
@@ -349,7 +352,8 @@ pub struct SyncRootMonitor {
     // Diagnostics for an unavailable current CFAPI inspection are emitted
     // only on the failure edge, not on every monitor walk.
     unavailable_cfapi_inspections: HashSet<String>,
-    pending_object_renames: Vec<LocalRenamePair>,
+    work: CfapiWork,
+    startup_prepared: bool,
     dehydrations_in_flight: Arc<Mutex<HashSet<String>>>,
     hydrations_in_flight: Arc<Mutex<HashSet<String>>>,
     remote_applied_tracker: RemoteAppliedTracker,
@@ -445,29 +449,166 @@ impl RemoteAppliedTracker {
     }
 }
 
+pub(crate) fn journal_path(
+    sync_root: &std::path::Path,
+    identity: &crate::sync_root_identity::SyncRootIdentity,
+) -> PathBuf {
+    let prefix = crate::sync_root_identity::normalize_prefix(Some(&identity.prefix));
+    let profile = blake3::hash(format!("{}:{prefix}", identity.cluster_id).as_bytes()).to_hex();
+    crate::local_state::local_appdata_sync_root_state_dir(sync_root).join(format!(
+        "sync-work-{}-{profile}.sqlite",
+        identity.provider_instance_id
+    ))
+}
+
 impl SyncRootMonitor {
+    #[cfg(test)]
     pub fn new(
         name: &str,
         sync_root: PathBuf,
         provider_instance_id: uuid::Uuid,
         uploader: Arc<dyn Uploader>,
     ) -> Self {
-        Self {
-            name: name.to_string(),
+        Self::from_store(
+            name,
             sync_root,
             provider_instance_id,
             uploader,
-            prior_paths: HashMap::new(),
+            sync_agent_core::sync_work::WorkStore::open(":memory:").expect("test work journal"),
+        )
+        .expect("test monitor")
+    }
+
+    pub(crate) fn open(
+        name: &str,
+        sync_root: PathBuf,
+        identity: &crate::sync_root_identity::SyncRootIdentity,
+        uploader: Arc<dyn Uploader>,
+    ) -> anyhow::Result<Self> {
+        let path = journal_path(&sync_root, identity);
+        let mut monitor = Self::from_store(
+            name,
+            sync_root,
+            identity.provider_instance_id,
+            uploader.clone(),
+            sync_agent_core::sync_work::WorkStore::open_for_executor(path)?,
+        )?;
+        monitor.uploader = Arc::new(work::JournaledUploader {
+            inner: uploader,
+            work: monitor.work.clone(),
+        });
+        Ok(monitor)
+    }
+
+    fn from_store(
+        name: &str,
+        sync_root: PathBuf,
+        provider_instance_id: uuid::Uuid,
+        uploader: Arc<dyn Uploader>,
+        store: sync_agent_core::sync_work::WorkStore,
+    ) -> anyhow::Result<Self> {
+        let tracker = RemoteAppliedTracker::default();
+        let work = CfapiWork::new(
+            sync_root.clone(),
+            provider_instance_id,
+            store,
+            tracker.clone(),
+        )?;
+        Ok(Self {
+            name: name.to_owned(),
+            sync_root,
+            provider_instance_id,
+            uploader,
+            prior_paths: work.prior(),
             upload_observations: HashMap::new(),
             hydration_observations: HashMap::new(),
-            pending_uploads: HashSet::new(),
+            pending_uploads: work.pending_uploads()?,
             unavailable_cfapi_inspections: HashSet::new(),
-            pending_object_renames: Vec::new(),
+            work,
+            startup_prepared: false,
             dehydrations_in_flight: Arc::new(Mutex::new(HashSet::new())),
             hydrations_in_flight: Arc::new(Mutex::new(HashSet::new())),
-            remote_applied_tracker: RemoteAppliedTracker::default(),
+            remote_applied_tracker: tracker,
             refresh_gate: Arc::new(Mutex::new(())),
+        })
+    }
+
+    pub(crate) fn uploader(&self) -> Arc<dyn Uploader> {
+        self.uploader.clone()
+    }
+
+    pub(crate) fn work(&self) -> CfapiWork {
+        self.work.clone()
+    }
+
+    /// Recover local intent from the persisted namespace BEFORE remote reconciliation
+    /// can materialize an older snapshot over a deletion or move.
+    pub(crate) fn prepare_startup(&mut self) -> anyhow::Result<()> {
+        self.work.recover_upload_observations()?;
+        self.work.drain_upload_receipts()?;
+        self.prior_paths.extend(self.work.prior());
+        let snapshot = self.snapshot_entries();
+        let mut current = snapshot.entries;
+        for (path, entry) in &current {
+            if !entry.is_placeholder
+                && !entry.is_dir
+                && self
+                    .prior_paths
+                    .get(path)
+                    .is_some_and(|prior| prior.object_id.is_some())
+            {
+                self.pending_uploads.insert(path.clone());
+            }
         }
+        let previous = self.prior_paths.clone();
+        if snapshot.walk_error_count == 0 {
+            self.work.cancel_missing_uploads(&current)?;
+            let renamed = self.handle_local_object_renames(&mut current)?;
+            self.handle_deleted_entries(&mut current, &renamed)?;
+            self.prior_paths = current
+                .iter()
+                .map(|(path, entry)| {
+                    (
+                        path.clone(),
+                        PriorPath::advance(
+                            entry,
+                            self.prior_paths.get(path),
+                            self.pending_uploads.contains(path),
+                        ),
+                    )
+                })
+                .collect();
+        } else {
+            let mut retained = self.prior_paths.clone();
+            retained.extend(current.iter().map(|(path, entry)| {
+                (
+                    path.clone(),
+                    PriorPath::advance(
+                        entry,
+                        self.prior_paths.get(path),
+                        self.pending_uploads.contains(path),
+                    ),
+                )
+            }));
+            self.prior_paths = retained;
+        }
+        if !self.startup_prepared {
+            self.upload_observations = current
+                .iter()
+                .filter(|(_, entry)| entry.is_placeholder)
+                .filter_map(|(path, entry)| {
+                    UploadObservation::advance(entry, None).map(|state| (path.clone(), state))
+                })
+                .collect();
+            self.hydration_observations = current
+                .iter()
+                .filter_map(|(path, entry)| {
+                    HydrationObservation::advance(entry, None).map(|state| (path.clone(), state))
+                })
+                .collect();
+            self.startup_prepared = true;
+        }
+        self.work.persist_prior(&previous, &self.prior_paths)
     }
 
     pub fn remote_applied_tracker(&self) -> RemoteAppliedTracker {
@@ -478,6 +619,7 @@ impl SyncRootMonitor {
         self.refresh_gate.clone()
     }
 
+    #[cfg(test)]
     pub fn run(&mut self) {
         loop {
             self.walk();
@@ -485,6 +627,7 @@ impl SyncRootMonitor {
         }
     }
 
+    #[cfg(test)]
     pub fn seed_seen(&mut self) {
         let snapshot = self.snapshot_entries();
         if snapshot.walk_error_count != 0 {
@@ -498,10 +641,12 @@ impl SyncRootMonitor {
         self.replace_observation_baseline(&snapshot.entries);
     }
 
+    #[cfg(test)]
     pub fn seed_remote_entries(&mut self, plan: &CfapiActionPlan) {
         self.seed_remote_entries_with_suppressed_paths(plan, &std::collections::BTreeSet::new());
     }
 
+    #[cfg(test)]
     pub fn seed_remote_entries_with_suppressed_paths(
         &mut self,
         plan: &CfapiActionPlan,
@@ -563,17 +708,34 @@ impl SyncRootMonitor {
     }
 
     pub fn walk(&mut self) {
+        if let Err(error) = self.try_walk() {
+            tracing::error!(
+                "{}: durable sync walk failed without advancing its baseline: {error:#}",
+                self.name
+            );
+        }
+    }
+
+    fn try_walk(&mut self) -> anyhow::Result<()> {
         let refresh_gate = self.refresh_gate.clone();
         let _refresh_gate = refresh_gate
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.work.recover_upload_observations()?;
+        self.work.drain_upload_receipts()?;
+        self.prior_paths.extend(self.work.prior());
+        let previous = self.prior_paths.clone();
         let SnapshotEntries {
             entries: current,
             walk_error_count,
             walk_error_samples,
         } = self.snapshot_entries();
         let mut current = current;
-        let handled_renames = self.handle_local_object_renames(&mut current);
+        let handled_renames = if walk_error_count == 0 {
+            self.handle_local_object_renames(&mut current)?
+        } else {
+            self.work.protected_paths()?.into_iter().collect()
+        };
         let dehydrate_summary = summarize_dehydrate_scan(&current);
         let paths = current.keys().cloned().collect::<Vec<_>>();
         for rel_path in paths {
@@ -588,7 +750,8 @@ impl SyncRootMonitor {
 
         self.log_dehydrate_scan_summary(dehydrate_summary);
         if walk_error_count == 0 {
-            self.handle_deleted_entries(&current, &handled_renames);
+            self.work.cancel_missing_uploads(&current)?;
+            self.handle_deleted_entries(&mut current, &handled_renames)?;
             self.pending_uploads
                 .retain(|path| current.contains_key(path));
             self.unavailable_cfapi_inspections.retain(|path| {
@@ -608,6 +771,7 @@ impl SyncRootMonitor {
                 walk_error_samples
             );
         }
+        self.work.persist_prior(&previous, &self.prior_paths)
     }
 
     fn update_partial_observation_baseline(
@@ -667,145 +831,86 @@ impl SyncRootMonitor {
     fn handle_local_object_renames(
         &mut self,
         current: &mut HashMap<String, ObservedEntry>,
-    ) -> std::collections::HashSet<String> {
-        let mut rename_pairs = detect_local_object_renames(&self.prior_paths, current);
-        let detected_pairs = rename_pairs
-            .iter()
-            .map(|rename| (rename.from_path.clone(), rename.to_path.clone()))
-            .collect::<std::collections::HashSet<_>>();
-        for mut pending in std::mem::take(&mut self.pending_object_renames) {
-            let key = (pending.from_path.clone(), pending.to_path.clone());
-            if detected_pairs.contains(&key) {
-                continue;
-            }
-            let retry_is_still_safe = !current.contains_key(&pending.from_path)
-                && current.get(&pending.to_path).is_some_and(|entry| {
-                    entry.placeholder_identity_path.as_deref() == Some(pending.from_path.as_str())
-                        && entry.placeholder_object_id.is_some()
-                        && entry.placeholder_revision.is_some()
-                });
-            if retry_is_still_safe {
-                pending.detection = "retry-after-transient-error";
-                rename_pairs.push(pending);
-            }
-        }
-        rename_pairs.sort_by(|left, right| left.from_path.cmp(&right.from_path));
-        let mut handled_paths = std::collections::HashSet::new();
-
-        for rename in rename_pairs {
-            let full_path = self.sync_root.join(
-                rename
-                    .to_path
-                    .replace('/', std::path::MAIN_SEPARATOR.to_string().as_str()),
-            );
-            tracing::info!(
-                "{}: detected local object rename {} -> {} detection={} state_before={} state_after={}",
-                self.name,
-                rename.from_path,
-                rename.to_path,
-                rename.detection,
-                self.prior_paths
-                    .get(&rename.from_path)
-                    .map(PriorPath::to_log_string)
-                    .unwrap_or_else(|| String::from("<missing>")),
-                current
-                    .get(&rename.to_path)
-                    .map(|entry| entry.to_log_string())
-                    .unwrap_or_else(|| String::from("<missing>")),
-            );
-
-            let entry = current
-                .get(&rename.to_path)
-                .expect("object-id rename candidates must exist in the current snapshot");
-            let object_id = entry
-                .placeholder_object_id
-                .as_deref()
-                .expect("object-id rename candidates must carry object_id")
-                .to_string();
-            let expected_revision = entry
-                .placeholder_revision
-                .as_deref()
-                .expect("object-id rename candidates must carry a revision")
-                .to_string();
-            let is_dir = entry.is_dir;
-            let remote_destination = remote_rename_destination(&rename.to_path, is_dir);
-            match self
-                .uploader
-                .rename_object(&object_id, &expected_revision, &remote_destination)
+    ) -> anyhow::Result<HashSet<String>> {
+        for (path, entry) in current.iter() {
+            if self
+                .prior_paths
+                .get(path)
+                .is_some_and(|prior| prior.is_dir != entry.is_dir && prior.object_id.is_some())
             {
-                Ok(receipt) => {
-                    handled_paths.insert(rename.from_path.clone());
-                    handled_paths.insert(rename.to_path.clone());
-                    if receipt.object_id != object_id || receipt.remote_version.trim().is_empty() {
-                        tracing::error!(
-                            "{}: remote rename returned an invalid post-mutation identity for {} -> {}; preserving local move as a conflict",
-                            self.name,
-                            rename.from_path,
-                            rename.to_path
-                        );
-                        mark_local_rename_conflict(&full_path);
-                        continue;
-                    }
-                    tracing::info!(
-                        "{}: remote rename applied {} -> {} raw_state={}",
-                        self.name,
-                        rename.from_path,
-                        rename.to_path,
-                        describe_path_state(&full_path)
-                    );
-                    if let Err(err) = repair_locally_renamed_object(
-                        &self.sync_root,
-                        &full_path,
-                        &rename.to_path,
-                        self.provider_instance_id,
-                        is_dir,
-                        &receipt,
-                    ) {
-                        tracing::info!(
-                            "{}: failed to repair local renamed file {} after remote rename: {:#} state={}",
-                            self.name,
-                            rename.to_path,
-                            err,
-                            describe_path_state(&full_path)
-                        );
-                        mark_local_rename_conflict(&full_path);
+                let gate =
+                    crate::path_operations::gate(&self.sync_root.join(path.replace('/', "\\")));
+                let _path_operation = gate.lock().unwrap_or_else(|e| e.into_inner());
+                let length = if entry.is_dir {
+                    b"<DIR>".len() as u64
+                } else {
+                    entry.materialized_file.map_or(0, |file| file.len)
+                };
+                if self.work.stage_kind_replacement(path, entry.is_dir)?
+                    && (entry.placeholder_object_id.is_none()
+                        || entry
+                            .placeholder_state
+                            .is_some_and(placeholder_has_uploadable_local_content))
+                {
+                    let upload_path = if entry.is_dir {
+                        directory_marker_path(path)
                     } else {
-                        self.seed_existing_entry(current, &rename.to_path, is_dir);
-                    }
-                }
-                Err(err) if is_remote_mutation_conflict(&err) => {
-                    handled_paths.insert(rename.from_path.clone());
-                    handled_paths.insert(rename.to_path.clone());
-                    tracing::info!(
-                        "{}: remote rename conflicted {} -> {}: {:#}; preserving the local move without upload/delete fallback",
-                        self.name,
-                        rename.from_path,
-                        rename.to_path,
-                        err
-                    );
-                    mark_local_rename_conflict(&full_path);
-                }
-                Err(err) => {
-                    // A transport failure says nothing about the remote object
-                    // state. Keep the pre-rename entry in the next baseline so
-                    // this same object-id rename is detected and retried on
-                    // the next scan, while suppressing path-based delete or
-                    // upload fallbacks for the current pass.
-                    self.pending_object_renames.push(rename.clone());
-                    handled_paths.insert(rename.from_path.clone());
-                    handled_paths.insert(rename.to_path.clone());
-                    tracing::warn!(
-                        "{}: transient remote rename failure {} -> {}: {:#}; retaining the object-id rename for retry",
-                        self.name,
-                        rename.from_path,
-                        rename.to_path,
-                        err
-                    );
+                        path.clone()
+                    };
+                    self.work.enqueue_upload(
+                        &upload_path,
+                        entry.placeholder_object_id.as_deref(),
+                        entry.placeholder_revision.as_deref(),
+                        length,
+                    )?;
+                    self.pending_uploads.insert(path.clone());
                 }
             }
         }
-
-        handled_paths
+        self.work.reconcile_pending_renames(current)?;
+        let mut new_intents = Vec::new();
+        for rename in detect_local_object_renames(&self.prior_paths, current) {
+            tracing::debug!(
+                from = rename.from_path,
+                to = rename.to_path,
+                detection = rename.detection,
+                "queueing local object rename"
+            );
+            let entry = &current[&rename.to_path];
+            let intent = work::LocalMutation::Rename {
+                from: rename.from_path,
+                to: rename.to_path,
+                object_id: entry
+                    .placeholder_object_id
+                    .clone()
+                    .expect("rename identity"),
+                revision: entry.placeholder_revision.clone().expect("rename revision"),
+                is_dir: entry.is_dir,
+            };
+            new_intents.push(intent);
+        }
+        self.work.enqueue_intents(&new_intents)?;
+        let intents = self.work.local_intents()?;
+        let ids = intents
+            .iter()
+            .map(|intent| intent.object_id())
+            .collect::<HashSet<_>>();
+        let mut handled: HashSet<String> = intents
+            .iter()
+            .flat_map(|intent| intent.paths().into_iter().map(ToOwned::to_owned))
+            .collect();
+        handled.extend(
+            self.prior_paths
+                .iter()
+                .filter(|(_, prior)| {
+                    prior
+                        .object_id
+                        .as_deref()
+                        .is_some_and(|id| ids.contains(id))
+                })
+                .map(|(path, _)| path.clone()),
+        );
+        Ok(handled)
     }
 
     fn log_dehydrate_scan_summary(&self, summary: DehydrateScanSummary) {
@@ -933,10 +1038,16 @@ impl SyncRootMonitor {
         {
             return;
         }
+        let path_gate = crate::path_operations::gate(path);
+        let _path_operation = path_gate.lock().unwrap_or_else(|e| e.into_inner());
         let entry = match current.get(&rel_path).cloned() {
+            Some(entry) if path.exists() => {
+                snapshot_entry(&self.sync_root, &rel_path, path, entry.is_dir)
+            }
             Some(entry) => entry,
             None => return,
         };
+        current.insert(rel_path.clone(), entry.clone());
         let previous_path = self.prior_paths.get(&rel_path).cloned();
         if entry.placeholder_inspection_error.is_some() {
             if update_cfapi_inspection_failure_state(
@@ -1470,78 +1581,47 @@ impl SyncRootMonitor {
 
     fn handle_deleted_entries(
         &self,
-        current: &HashMap<String, ObservedEntry>,
-        handled_renames: &std::collections::HashSet<String>,
-    ) {
-        let mut deleted_paths = self
-            .prior_paths
-            .iter()
-            .filter_map(|(path, entry)| {
-                if current.contains_key(path) {
-                    None
-                } else {
-                    Some((path.as_str(), entry.clone()))
-                }
-            })
-            .collect::<Vec<_>>();
-        deleted_paths.sort_by(|(left_path, _), (right_path, _)| right_path.cmp(left_path));
-
-        for (path, entry) in deleted_paths {
-            if is_internal_client_identity_relative_path(path)
+        current: &mut HashMap<String, ObservedEntry>,
+        handled_renames: &HashSet<String>,
+    ) -> anyhow::Result<()> {
+        let mut intents = Vec::new();
+        for (path, entry) in &self.prior_paths {
+            if current.contains_key(path)
+                || handled_renames.contains(path)
+                || is_internal_client_identity_relative_path(path)
                 || is_internal_connection_bootstrap_relative_path(path)
                 || is_internal_remote_snapshot_relative_path(path)
+                || self
+                    .remote_applied_tracker
+                    .take_file_removal_suppression(path)
             {
                 continue;
             }
-            if handled_renames.contains(path) {
-                tracing::info!(
-                    "{}: skipping delete handling for renamed path {}",
-                    self.name,
-                    path
-                );
-                continue;
-            }
-            if self
-                .remote_applied_tracker
-                .take_file_removal_suppression(path)
-            {
-                tracing::info!(
-                    "{}: suppressing remote-applied local removal for {}",
-                    self.name,
-                    path
-                );
-                continue;
-            }
-            let (Some(object_id), Some(expected_revision)) =
-                (entry.object_id.as_deref(), entry.revision.as_deref())
-            else {
-                tracing::warn!(
-                    "{}: refusing path-only remote delete for {}; placeholder identity is incomplete",
-                    self.name,
-                    path
-                );
+            let (Some(object_id), Some(revision)) = (&entry.object_id, &entry.revision) else {
                 continue;
             };
-            let object_kind = if entry.is_dir { "directory" } else { "file" };
-            tracing::info!(
-                "{}: detected deleted {} {} object_id={} expected_revision={}",
-                self.name,
-                object_kind,
+            tracing::debug!(
                 path,
-                object_id,
-                expected_revision
+                state = entry.to_log_string(),
+                "queueing local object delete"
             );
-            if let Err(err) = self.uploader.delete_object(object_id, expected_revision) {
-                tracing::info!(
-                    "{}: failed to delete remote {} {} object_id={}: {}",
-                    self.name,
-                    object_kind,
-                    path,
-                    object_id,
-                    err
-                );
+            intents.push(work::LocalMutation::Delete {
+                path: path.clone(),
+                renamed_from: None,
+                object_id: object_id.clone(),
+                revision: revision.clone(),
+                is_dir: entry.is_dir,
+            });
+        }
+        self.work.enqueue_deletes(&intents)?;
+        let intents = self.work.local_intents()?;
+        self.work.drain_mutations(self.uploader.as_ref())?;
+        for intent in intents {
+            if let work::LocalMutation::Rename { to, is_dir, .. } = intent {
+                self.seed_existing_entry(current, &to, is_dir);
             }
         }
+        Ok(())
     }
 }
 
@@ -1776,34 +1856,47 @@ fn snapshot_entry_with_placeholder_state(
     placeholder_state: anyhow::Result<u32>,
 ) -> ObservedEntry {
     let metadata = std::fs::metadata(path).ok();
-    let (placeholder_state_bits, classification_error) = match placeholder_state {
+    let (mut placeholder_state_bits, classification_error) = match placeholder_state {
         Ok(state) => (state, None),
-        Err(err) => (
+        Err(error) => (
             CF_PLACEHOLDER_STATE_NO_STATES,
-            Some(format!("failed to classify placeholder state: {err:#}")),
+            Some(format!("failed to classify placeholder state: {error:#}")),
         ),
     };
-    let is_placeholder = (placeholder_state_bits & CF_PLACEHOLDER_STATE_PLACEHOLDER) != 0;
-    let placeholder_probe = is_placeholder.then(|| {
+    let attribute_placeholder = (placeholder_state_bits & CF_PLACEHOLDER_STATE_PLACEHOLDER) != 0;
+    // Directory enumeration attributes can lag CFAPI identity. A successful
+    // metadata-only CfGetPlaceholderInfo is authoritative; a negative attribute
+    // hint must never turn a cold placeholder into an ordinary content upload.
+    let placeholder_probe = classification_error.is_none().then(|| {
         open_sync_path(path, false)
             .map_err(anyhow::Error::from)
             .and_then(|file| cf_get_placeholder_standard_info_with_identity(&file))
     });
     let (placeholder_identity, placeholder_state, probe_error) = match placeholder_probe {
         Some(Ok(info)) => {
-            let file_identity = info.file_identity();
-            let identity = if file_identity.is_empty() {
-                None
-            } else {
-                decode_placeholder_file_identity(file_identity)
-            };
+            placeholder_state_bits |= CF_PLACEHOLDER_STATE_PLACEHOLDER;
+            if !attribute_placeholder
+                && !is_dir
+                && metadata.as_ref().is_none_or(|metadata| {
+                    info.info().OnDiskDataSize < i64::try_from(metadata.len()).unwrap_or(i64::MAX)
+                })
+            {
+                placeholder_state_bits |= CF_PLACEHOLDER_STATE_PARTIAL;
+            }
+            let identity = decode_placeholder_file_identity(info.file_identity());
             let state = (!is_dir)
                 .then(|| PlaceholderSnapshot::from_info(info.info(), placeholder_state_bits));
             (identity, state, None)
         }
-        Some(Err(err)) => (None, None, Some(format!("{err:#}"))),
+        Some(Err(error))
+            if ordinary_probe_failure_for_root(&error, attribute_placeholder, sync_root) =>
+        {
+            (None, None, None)
+        }
+        Some(Err(error)) => (None, None, Some(format!("{error:#}"))),
         None => (None, None, None),
     };
+    let is_placeholder = (placeholder_state_bits & CF_PLACEHOLDER_STATE_PLACEHOLDER) != 0;
     let placeholder_inspection_error = classification_error.or(probe_error);
     ObservedEntry {
         is_dir,
@@ -1832,6 +1925,46 @@ fn snapshot_entry_with_placeholder_state(
             })
             .flatten(),
     }
+}
+
+fn ordinary_probe_failure_for_root(
+    error: &anyhow::Error,
+    attribute_placeholder: bool,
+    root: &std::path::Path,
+) -> bool {
+    let registered = if !attribute_placeholder
+        && error_chain_has_win32_hresult(
+            error,
+            windows_sys::Win32::Foundation::ERROR_INVALID_FUNCTION,
+        ) {
+        crate::sync_root_identity::load_registered_sync_root_context(root)
+            .ok()
+            .map(|context| context.is_some())
+    } else {
+        None
+    };
+    probe_error_is_ordinary(error, attribute_placeholder, registered)
+}
+
+fn probe_error_is_ordinary(
+    error: &anyhow::Error,
+    attribute_placeholder: bool,
+    root_registered: Option<bool>,
+) -> bool {
+    if attribute_placeholder {
+        return false;
+    }
+    error_chain_has_win32_hresult(
+        error,
+        windows_sys::Win32::Foundation::ERROR_NOT_A_CLOUD_FILE,
+    ) || error_chain_has_win32_hresult(
+        error,
+        windows_sys::Win32::Foundation::ERROR_CLOUD_FILE_NOT_UNDER_SYNC_ROOT,
+    ) || (root_registered == Some(false)
+        && error_chain_has_win32_hresult(
+            error,
+            windows_sys::Win32::Foundation::ERROR_INVALID_FUNCTION,
+        ))
 }
 
 fn summarize_dehydrate_scan(entries: &HashMap<String, ObservedEntry>) -> DehydrateScanSummary {
@@ -1891,6 +2024,46 @@ fn parent_directories_for_path(path: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn journal_profile_uses_registered_cluster_and_prefix_instead_of_endpoint_labels() {
+        let provider = uuid::Uuid::new_v4();
+        let cluster = uuid::Uuid::new_v4();
+        let root = Path::new("C:/sync/profile");
+        let first = crate::sync_root_identity::SyncRootIdentity::new(
+            provider,
+            cluster,
+            "https://first",
+            "docs/",
+        );
+        let alternate = crate::sync_root_identity::SyncRootIdentity::new(
+            provider,
+            cluster,
+            "https://failover",
+            "docs",
+        );
+        assert_eq!(journal_path(root, &first), journal_path(root, &alternate));
+        let other_cluster = crate::sync_root_identity::SyncRootIdentity::new(
+            provider,
+            uuid::Uuid::new_v4(),
+            "https://first",
+            "docs",
+        );
+        let other_prefix = crate::sync_root_identity::SyncRootIdentity::new(
+            provider,
+            cluster,
+            "https://first",
+            "other",
+        );
+        assert_ne!(
+            journal_path(root, &first),
+            journal_path(root, &other_cluster)
+        );
+        assert_ne!(
+            journal_path(root, &first),
+            journal_path(root, &other_prefix)
+        );
+    }
     use crate::placeholder_metadata::reconcile_existing_placeholders;
     use crate::runtime::{
         SyncRootRegistration, apply_action_plan, register_sync_root, unregister_sync_root,
@@ -1904,6 +2077,21 @@ mod tests {
         CF_IN_SYNC_STATE_NOT_IN_SYNC, CF_PIN_STATE_PINNED, CF_PIN_STATE_UNSPECIFIED,
     };
     use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_WRITE};
+
+    #[test]
+    fn invalid_function_probe_is_ordinary_only_with_negative_hint_and_unregistered_root() {
+        let error =
+            crate::helpers::hresult_nonneg(0x80070001_u32 as i32, "injected ordinary file probe")
+                .unwrap_err();
+        assert!(probe_error_is_ordinary(&error, false, Some(false)));
+        assert!(!probe_error_is_ordinary(&error, true, Some(false)));
+        assert!(!probe_error_is_ordinary(&error, false, Some(true)));
+        assert!(!probe_error_is_ordinary(&error, false, None));
+        let sharing =
+            crate::helpers::hresult_nonneg(0x80070020_u32 as i32, "injected sharing failure")
+                .unwrap_err();
+        assert!(!probe_error_is_ordinary(&sharing, false, Some(false)));
+    }
 
     #[derive(Default)]
     struct MockUploader {
@@ -1925,8 +2113,8 @@ mod tests {
 
     /// A real Windows CFAPI registration so the monitor observes the same placeholder kind that
     /// remote reconciliation removes in production.
-    struct RegisteredMonitorTestSyncRoot {
-        root_path: PathBuf,
+    pub(super) struct RegisteredMonitorTestSyncRoot {
+        pub(super) root_path: PathBuf,
         _registration_lock: std::sync::MutexGuard<'static, ()>,
     }
 
@@ -2413,7 +2601,7 @@ mod tests {
         );
     }
 
-    fn registered_monitor_test_sync_root(
+    pub(super) fn registered_monitor_test_sync_root(
         test_name: &str,
     ) -> (RegisteredMonitorTestSyncRoot, uuid::Uuid) {
         let registration_lock = crate::lock_sync_root_registration_tests();
@@ -2439,7 +2627,7 @@ mod tests {
         )
     }
 
-    fn create_clean_provider_placeholder(
+    pub(super) fn create_clean_provider_placeholder(
         sync_root: &std::path::Path,
         provider_instance_id: uuid::Uuid,
         path: &str,
@@ -2597,8 +2785,10 @@ mod tests {
             .copied()
             .unwrap_or(0);
         assert_eq!(
-            attempts, 2,
-            "local file should be retried after an upload failure"
+            attempts,
+            2,
+            "local file should be retried after an upload failure; observations={:?}",
+            monitor.snapshot_entries()
         );
         assert_eq!(
             uploader
@@ -2711,7 +2901,8 @@ mod tests {
                 .expect("uploads lock poisoned")
                 .as_slice(),
             ["docs/entry/"],
-            "a directory replacing a file must not be hidden by the prior file topology"
+            "a directory replacing a file must not be hidden by the prior file topology; observations={:?}",
+            monitor.snapshot_entries()
         );
 
         let _ = std::fs::remove_dir_all(sync_root);
@@ -2857,7 +3048,8 @@ mod tests {
             PriorPath::from_observed(&observed_entry(false)),
         );
 
-        let current = HashMap::from([(String::from("docs/new-name.txt"), observed_entry(false))]);
+        let mut current =
+            HashMap::from([(String::from("docs/new-name.txt"), observed_entry(false))]);
         let handled_renames = HashSet::from([
             String::from("docs/old-name.txt"),
             String::from("docs/new-name.txt"),
@@ -2870,7 +3062,9 @@ mod tests {
         assert!(monitor.prior_paths.contains_key("docs/keep.txt"));
         assert!(!monitor.prior_paths.contains_key("docs/old-name.txt"));
 
-        monitor.handle_deleted_entries(&current, &handled_renames);
+        monitor
+            .handle_deleted_entries(&mut current, &handled_renames)
+            .unwrap();
 
         assert!(
             uploader
@@ -2981,7 +3175,9 @@ mod tests {
             .prior_paths
             .insert("documents".to_string(), directory);
 
-        monitor.handle_deleted_entries(&HashMap::new(), &HashSet::new());
+        monitor
+            .handle_deleted_entries(&mut HashMap::new(), &HashSet::new())
+            .unwrap();
 
         assert_eq!(
             uploader
@@ -3047,33 +3243,121 @@ mod tests {
     }
 
     #[test]
+    fn pending_rename_tracks_a_second_move_or_delete_across_restart() {
+        struct ChainedUploader {
+            renames: Mutex<Vec<String>>,
+            deletes: Mutex<Vec<(String, String)>>,
+        }
+        impl Uploader for ChainedUploader {
+            fn upload_reader(
+                &self,
+                _: &str,
+                _: &mut dyn Read,
+                _: u64,
+            ) -> anyhow::Result<UploadReceipt> {
+                anyhow::bail!("unexpected content upload")
+            }
+            fn rename_object(
+                &self,
+                _: &str,
+                _: &str,
+                to: &str,
+            ) -> anyhow::Result<crate::runtime::ObjectRenameReceipt> {
+                self.renames.lock().unwrap().push(to.to_owned());
+                anyhow::bail!("temporary transport failure")
+            }
+            fn delete_object(&self, id: &str, rev: &str) -> anyhow::Result<()> {
+                self.deletes.lock().unwrap().push((id.into(), rev.into()));
+                Ok(())
+            }
+        }
+        for deleted in [false, true] {
+            let (sync_root, provider) = registered_monitor_test_sync_root("chained-local-rename");
+            create_clean_provider_placeholder(&sync_root.root_path, provider, "a.txt");
+            let state = std::env::temp_dir()
+                .join(format!("berrykeep-chain-state-{}", uuid::Uuid::new_v4()))
+                .join("work.sqlite");
+            let uploader = Arc::new(ChainedUploader {
+                renames: Mutex::default(),
+                deletes: Mutex::default(),
+            });
+            let mut monitor = SyncRootMonitor::from_store(
+                "test",
+                sync_root.root_path.clone(),
+                provider,
+                uploader.clone(),
+                sync_agent_core::sync_work::WorkStore::open(&state).unwrap(),
+            )
+            .unwrap();
+            monitor.prepare_startup().unwrap();
+            std::fs::rename(
+                sync_root.root_path.join("a.txt"),
+                sync_root.root_path.join("b.txt"),
+            )
+            .unwrap();
+            monitor.try_walk().unwrap();
+            assert_eq!(*uploader.renames.lock().unwrap(), vec!["b.txt"]);
+            drop(monitor);
+            if deleted {
+                std::fs::remove_file(sync_root.root_path.join("b.txt")).unwrap();
+            } else {
+                std::fs::rename(
+                    sync_root.root_path.join("b.txt"),
+                    sync_root.root_path.join("c.txt"),
+                )
+                .unwrap();
+            }
+            let mut reopened = SyncRootMonitor::from_store(
+                "test",
+                sync_root.root_path.clone(),
+                provider,
+                uploader.clone(),
+                sync_agent_core::sync_work::WorkStore::open(&state).unwrap(),
+            )
+            .unwrap();
+            reopened.prepare_startup().unwrap();
+            assert_eq!(reopened.work.status().unwrap().conflicts, 0);
+            if deleted {
+                assert_eq!(
+                    *uploader.deletes.lock().unwrap(),
+                    vec![("test-object".into(), "newer-revision".into())]
+                );
+                assert!(reopened.work.local_intents().unwrap().is_empty());
+            } else {
+                assert_eq!(*uploader.renames.lock().unwrap(), vec!["b.txt", "c.txt"]);
+                assert!(
+                    matches!(&reopened.work.local_intents().unwrap()[0], work::LocalMutation::Rename { from, to, revision, .. } if from == "a.txt" && to == "c.txt" && revision == "newer-revision")
+                );
+            }
+        }
+    }
+
+    #[test]
     fn transient_object_id_rename_failure_is_retried_after_topology_baseline_advances() {
-        let unique = uuid::Uuid::new_v4();
-        let sync_root =
-            std::env::temp_dir().join(format!("berrykeep-monitor-rename-retry-{unique}"));
+        let (sync_root, provider) = registered_monitor_test_sync_root("durable-rename-retry");
+        create_clean_provider_placeholder(&sync_root.root_path, provider, "docs/old.txt");
         let uploader = Arc::new(TransientRenameUploader::default());
         let mut monitor = SyncRootMonitor::new(
             "monitor-test",
-            sync_root,
-            uuid::Uuid::nil(),
+            sync_root.root_path.clone(),
+            provider,
             uploader.clone(),
         );
-
-        let mut old_entry = observed_entry(false);
-        old_entry.placeholder_identity_path = Some("docs/old.txt".to_string());
-        old_entry.placeholder_object_id = Some("obj-document".to_string());
-        old_entry.placeholder_revision = Some("revision-3".to_string());
-        let current_entry = old_entry.clone();
-        monitor.prior_paths.insert(
-            "docs/old.txt".to_string(),
-            PriorPath::from_observed(&old_entry),
-        );
-        let mut current = HashMap::from([("archive/new.txt".to_string(), current_entry)]);
-
-        let first_handled = monitor.handle_local_object_renames(&mut current);
+        monitor.seed_seen();
+        std::fs::create_dir_all(sync_root.root_path.join("archive")).unwrap();
+        std::fs::rename(
+            sync_root.root_path.join("docs/old.txt"),
+            sync_root.root_path.join("archive/new.txt"),
+        )
+        .unwrap();
+        let mut current = monitor.snapshot_entries().entries;
+        let first_handled = monitor.handle_local_object_renames(&mut current).unwrap();
+        monitor
+            .handle_deleted_entries(&mut current, &first_handled)
+            .unwrap();
         assert!(first_handled.contains("docs/old.txt"));
         assert!(first_handled.contains("archive/new.txt"));
-        assert_eq!(monitor.pending_object_renames.len(), 1);
+        assert_eq!(monitor.work.local_intents().unwrap().len(), 1);
 
         // This models the end of a scan: only the destination remains in the
         // baseline, so a retry cannot rely on the removed source path.
@@ -3081,11 +3365,33 @@ mod tests {
             .iter()
             .map(|(path, entry)| (path.clone(), PriorPath::from_observed(entry)))
             .collect();
-        let second_handled = monitor.handle_local_object_renames(&mut current);
+        let retry = monitor
+            .work
+            .store
+            .claim_next(
+                work::LOCAL_SCOPE,
+                sync_agent_core::sync_work::now_ms() + 10_000,
+                120_000,
+            )
+            .unwrap()
+            .unwrap();
+        monitor
+            .work
+            .store
+            .finish(
+                &retry,
+                sync_agent_core::sync_work::WorkResult::Retry("ready".into()),
+                0,
+            )
+            .unwrap();
+        let second_handled = monitor.handle_local_object_renames(&mut current).unwrap();
+        monitor
+            .handle_deleted_entries(&mut current, &second_handled)
+            .unwrap();
 
         assert!(second_handled.contains("docs/old.txt"));
         assert!(second_handled.contains("archive/new.txt"));
-        assert_eq!(monitor.pending_object_renames.len(), 1);
+        assert_eq!(monitor.work.local_intents().unwrap().len(), 1);
         assert_eq!(
             *uploader
                 .rename_attempts

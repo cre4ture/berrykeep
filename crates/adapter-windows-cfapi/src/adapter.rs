@@ -54,7 +54,7 @@ pub struct CfapiActionPlan {
     pub actions: Vec<CfapiAction>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum CfapiAction {
     EnsureDirectory {
         object_id: Option<String>,

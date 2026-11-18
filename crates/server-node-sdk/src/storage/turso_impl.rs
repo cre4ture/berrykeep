@@ -559,6 +559,24 @@ impl MetadataStore for TursoMetadataStore {
         Ok(keys)
     }
 
+    async fn has_current_object_descendants(&self, directory_key: &str) -> Result<bool> {
+        let upper = super::directory_descendant_upper_bound(directory_key)?;
+        let connection = self
+            .open_lookup_connection("directory live descendants")
+            .await?;
+        let mut rows = connection
+            .query(
+                "SELECT EXISTS(SELECT 1 FROM current_objects WHERE key > ?1 AND key < ?2)",
+                (directory_key, upper.as_str()),
+            )
+            .await?;
+        let row = rows
+            .next()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("directory descendant query returned no result"))?;
+        Ok(row_u64(&row, 0, "current_objects.has_descendants")? != 0)
+    }
+
     async fn list_keys_for_object_id(&self, object_id: &str) -> Result<Vec<String>> {
         let connection = self.open_lookup_connection("object keys by ID").await?;
         let mut rows = connection

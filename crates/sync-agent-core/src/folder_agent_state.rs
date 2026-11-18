@@ -393,6 +393,13 @@ impl StartupStateStore {
             .with_context(|| format!("failed to delete sqlite baseline row for {path}"))?;
         Ok(())
     }
+    pub fn remove_baseline_subtree(&self, path: &str) -> Result<()> {
+        self.sqlite_connection()?.execute(
+            "DELETE FROM baseline_entries WHERE path=?1 OR substr(path,1,length(?1)+1)=?1||'/'",
+            [path],
+        )?;
+        Ok(())
+    }
 
     pub fn persist_startup_conflicts(&self, conflicts: &[StartupConflict]) -> Result<()> {
         let mut connection = self.sqlite_connection()?;
@@ -427,6 +434,11 @@ impl StartupStateStore {
 
         tx.commit()
             .context("failed to commit sqlite conflicts transaction")?;
+        Ok(())
+    }
+
+    pub fn upsert_conflict(&self, path: &str, reason: &str, details_json: &str) -> Result<()> {
+        self.sqlite_connection()?.execute("INSERT INTO conflicts(path,reason,details_json,created_unix_ms) VALUES(?1,?2,?3,?4) ON CONFLICT(path) DO UPDATE SET reason=excluded.reason,details_json=excluded.details_json,created_unix_ms=excluded.created_unix_ms WHERE conflicts.reason<>excluded.reason OR conflicts.details_json<>excluded.details_json",params![path,reason,details_json,i64::try_from(current_unix_ms()).unwrap_or(i64::MAX)])?;
         Ok(())
     }
 

@@ -13,6 +13,7 @@ pub mod hydration_control;
 pub mod live;
 pub(crate) mod local_state;
 pub mod monitor;
+pub(crate) mod path_operations;
 pub mod placeholder_metadata;
 pub mod register;
 pub mod runtime;

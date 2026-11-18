@@ -172,7 +172,7 @@ pub struct HydrationResult {
     pub bytes_transferred: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct UploadReceipt {
     pub object_id: Option<String>,
     pub remote_version: Option<String>,
@@ -186,6 +186,12 @@ pub struct ObjectRenameReceipt {
 }
 
 pub trait Uploader: Send + Sync + 'static {
+    fn resolve_remote_object(
+        &self,
+        _object_id: &str,
+    ) -> Result<crate::placeholder_metadata::RemoteObjectResolution> {
+        anyhow::bail!("uploader does not support remote object resolution")
+    }
     fn upload_reader(
         &self,
         path: &str,
