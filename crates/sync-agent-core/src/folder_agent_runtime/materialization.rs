@@ -86,7 +86,7 @@ pub(super) fn publish_conflicts(journal: &WorkStore, state: &StartupStateStore) 
 
 pub(super) fn resolution_paths(journal: &WorkStore) -> Result<BTreeSet<String>> {
     Ok(journal
-        .all_work(SCOPE)?
+        .work(SCOPE)?
         .into_iter()
         .filter(|job| {
             job.payload

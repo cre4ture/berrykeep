@@ -1019,6 +1019,10 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
     let mut local_state = local_state_before_remote_sync;
     let mut remote_index = RemoteTreeIndex::default();
     let mut suppressed_uploads: BTreeMap<String, LocalEntryState> = BTreeMap::new();
+    // Capture only choices still awaiting execution at this startup. They may
+    // finish during the initial drain, but completed history from an earlier
+    // startup must never suppress a newly detected conflict at the same path.
+    let explicit_resolutions = materialization::resolution_paths(&materialization_journal)?;
     let mut initial_remote_outcome = materialization::apply_remote_snapshot_with_journal(
         &materialization_journal,
         backend,
@@ -1147,7 +1151,6 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
     state_store
         .persist_local_baseline(&local_state)
         .context("failed to persist sqlite baseline after startup reconciliation")?;
-    let explicit_resolutions = materialization::resolution_paths(&materialization_journal)?;
     startup_conflicts.retain(|conflict| !explicit_resolutions.contains(&conflict.path));
     state_store
         .persist_startup_conflicts(&startup_conflicts)
@@ -5068,6 +5071,74 @@ mod tests {
             "one capture for scheduling and one for execution, independent of directory count"
         );
         assert!(backend.local_entries.is_empty());
+    }
+
+    #[test]
+    fn completed_resolution_history_does_not_suppress_future_startup_conflicts() {
+        let root = crate::test_support::test_root();
+        let journal = crate::sync_work::WorkStore::open(root.join("work.sqlite")).unwrap();
+        let scope = "folder-materialization";
+        let snapshot = SyncSnapshot {
+            local: vec![],
+            remote: vec![sync_core::NamespaceEntry::file("item", "r1", "remote")],
+        };
+        let plan = folder_materialization_plan(
+            &snapshot,
+            &PathScope::new(None),
+            None,
+            &RemoteTreeIndex::default(),
+            &[],
+        )
+        .unwrap();
+        journal.reconcile(scope, &plan).unwrap();
+        let lease = journal
+            .claim_next(scope, crate::sync_work::now_ms(), 120_000)
+            .unwrap()
+            .unwrap();
+        journal
+            .finish(
+                &lease,
+                crate::sync_work::WorkResult::Conflict("edited locally".into()),
+                crate::sync_work::now_ms(),
+            )
+            .unwrap();
+        let reviewed = journal.conflicts(scope).unwrap().remove(0);
+        let mut authorized = reviewed.payload.clone();
+        authorized["resolution"] =
+            serde_json::to_value(crate::ConflictResolutionStrategy::KeepRemote).unwrap();
+        assert!(
+            journal
+                .authorize_conflict(scope, &reviewed, &authorized)
+                .unwrap()
+        );
+        let startup_choices = materialization::resolution_paths(&journal).unwrap();
+        assert_eq!(startup_choices, BTreeSet::from(["item".into()]));
+        let lease = journal
+            .claim_next(scope, crate::sync_work::now_ms(), 120_000)
+            .unwrap()
+            .unwrap();
+        journal
+            .finish(
+                &lease,
+                crate::sync_work::WorkResult::Complete,
+                crate::sync_work::now_ms(),
+            )
+            .unwrap();
+        assert_eq!(
+            journal.all_work(scope).unwrap().len(),
+            1,
+            "completed desired work retains its history"
+        );
+        assert!(
+            materialization::resolution_paths(&journal)
+                .unwrap()
+                .is_empty(),
+            "old choices cannot hide a new startup conflict"
+        );
+        assert!(
+            startup_choices.contains("item"),
+            "this startup retains its choice even when execution completes"
+        );
     }
 
     #[test]

@@ -75,7 +75,9 @@ delete executor for the chosen path. Editing a conflicted path alone never grant
 permission to overwrite it. Backends must implement conflict-copy preservation to
 support keep-remote; unsupported preservation fails without replacing local bytes.
 Local scans retain the previous baseline for paths blocked by remote work, avoiding
-upload/delete echoes while resolution is pending. Normal scheduling checks terminal
+upload/delete echoes while resolution is pending. Completed resolution history
+does not authorize later changes at that path or hide conflicts detected at a
+subsequent startup. Normal scheduling checks terminal
 retention at most once per day and retains seven days of historical terminal jobs,
 in addition to current desired completions and active prerequisites.
 
