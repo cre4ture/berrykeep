@@ -832,6 +832,41 @@ impl SyncRootMonitor {
         &mut self,
         current: &mut HashMap<String, ObservedEntry>,
     ) -> anyhow::Result<HashSet<String>> {
+        for (path, entry) in current.iter() {
+            if self
+                .prior_paths
+                .get(path)
+                .is_some_and(|prior| prior.is_dir != entry.is_dir && prior.object_id.is_some())
+            {
+                let gate =
+                    crate::path_operations::gate(&self.sync_root.join(path.replace('/', "\\")));
+                let _path_operation = gate.lock().unwrap_or_else(|e| e.into_inner());
+                let length = if entry.is_dir {
+                    b"<DIR>".len() as u64
+                } else {
+                    entry.materialized_file.map_or(0, |file| file.len)
+                };
+                if self.work.stage_kind_replacement(path, entry.is_dir)?
+                    && (entry.placeholder_object_id.is_none()
+                        || entry
+                            .placeholder_state
+                            .is_some_and(placeholder_has_uploadable_local_content))
+                {
+                    let upload_path = if entry.is_dir {
+                        directory_marker_path(path)
+                    } else {
+                        path.clone()
+                    };
+                    self.work.enqueue_upload(
+                        &upload_path,
+                        entry.placeholder_object_id.as_deref(),
+                        entry.placeholder_revision.as_deref(),
+                        length,
+                    )?;
+                    self.pending_uploads.insert(path.clone());
+                }
+            }
+        }
         self.work.reconcile_pending_renames(current)?;
         let mut new_intents = Vec::new();
         for rename in detect_local_object_renames(&self.prior_paths, current) {

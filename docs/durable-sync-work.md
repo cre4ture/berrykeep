@@ -32,7 +32,9 @@ the journal's next eligible deadline without waiting for another remote change.
 An empty journal does not add a retry timer. One-shot sync
 drains ready work and returns an error if a transfer fails. Pending startup
 preservation decisions and local file/subtree fingerprints survive restart;
-changed local bytes become conflicts instead of being overwritten on retry.
+local changes detected before execution or retry become conflicts instead of
+being overwritten by that queued operation. This does not add an atomic
+post-transfer write check to the folder agent's existing download executor.
 Folder uploads and remote mutations still use their existing path-based runtime;
 this integration does not change that protocol to object-ID mutations.
 
@@ -104,6 +106,11 @@ object identity is retained even when the file disappears before the first scan.
 Directory-marker deletion is nonrecursive and succeeds only when the server's
 live namespace has no descendants. A new or unseen child causes a mutation
 conflict (HTTP409); children are never swept away by an automatic recursive retry.
+Local kind replacements persist removal of the old object and the new upload
+before advancing the topology baseline. The replacement waits for guarded child
+and marker deletions, then creates a new identity; an unseen child preserves the
+local replacement and becomes an explicit conflict. Accepted receipts for the
+old kind remain deletion evidence and cannot bind its identity onto the new kind.
 Provider threads serialize each path through the entire close-upload finalizer,
 including its receipt, snapshot and USN checks. Receipt repair waits for that
 boundary and re-inspects identity before writing; it cannot invalidate a USN

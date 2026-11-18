@@ -4001,7 +4001,9 @@ pub struct ObjectMutationConflict {
 }
 
 impl ObjectMutationConflict {
-    fn new(operation: &'static str, target: impl Into<String>) -> Self {
+    /// Represent a confirmed identity or revision precondition conflict in a
+    /// higher-level durable executor using the same typed handling as HTTP409.
+    pub fn new(operation: &'static str, target: impl Into<String>) -> Self {
         Self {
             operation,
             target: target.into(),

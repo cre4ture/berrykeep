@@ -118,6 +118,61 @@ impl CfapiWork {
             .map(|work| work.key.trim_end_matches('/').to_owned())
             .collect())
     }
+
+    pub(super) fn enqueue_upload(
+        &self,
+        path: &str,
+        object_id: Option<&str>,
+        revision: Option<&str>,
+        length: u64,
+    ) -> Result<()> {
+        self.store.enqueue(UPLOAD_SCOPE, &[PlannedWork::new(path, format!("upload:{}", object_id.unwrap_or(path)),
+            serde_json::json!({"path":path,"object_id":object_id,"revision":revision,"length":length}))])?;
+        self.notify();
+        Ok(())
+    }
+
+    /// Persist the old namespace removal before allowing
+    /// a kind change to advance the scan baseline. Called while the path gate is
+    /// held; execution remains with the complete-topology namespace worker.
+    pub(super) fn stage_kind_replacement(&self, path: &str, is_dir: bool) -> Result<bool> {
+        let normalized = normalize_path(path);
+        let path = normalized.trim_end_matches('/');
+        let deletes = {
+            let baseline = self.baseline.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(old) = baseline.get(path).filter(|old| {
+                old.is_dir != is_dir && old.object_id.is_some() && old.revision.is_some()
+            }) else {
+                return Ok(false);
+            };
+            let prefix = format!("{path}/");
+            baseline
+                .iter()
+                .filter(|(candidate, _)| {
+                    candidate.as_str() == path || (old.is_dir && candidate.starts_with(&prefix))
+                })
+                .filter_map(|(path, old)| {
+                    Some(LocalMutation::Delete {
+                        path: path.clone(),
+                        renamed_from: None,
+                        object_id: old.object_id.clone()?,
+                        revision: old.revision.clone()?,
+                        is_dir: old.is_dir,
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        self.enqueue_deletes(&deletes)?;
+        self.store.cancel(
+            UPLOAD_SCOPE,
+            &if is_dir {
+                path.to_owned()
+            } else {
+                format!("{path}/")
+            },
+        )?;
+        Ok(true)
+    }
     pub(super) fn cancel_missing_uploads(
         &self,
         current: &HashMap<String, ObservedEntry>,
@@ -337,7 +392,21 @@ impl CfapiWork {
                 let full = self.root.join(path.replace('/', "\\"));
                 let gate = crate::path_operations::gate(&full);
                 let _path_operation = gate.lock().unwrap_or_else(|e| e.into_inner());
-                if !full.exists() {
+                let metadata = match std::fs::metadata(&full) {
+                    Ok(metadata) => metadata,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        return WorkResult::Complete;
+                    }
+                    Err(error) => {
+                        return WorkResult::Retry(format!(
+                            "receipt target metadata unavailable: {error}"
+                        ));
+                    }
+                };
+                if metadata.is_dir() != work.is_dir {
+                    // The accepted object was replaced by another kind. Retain
+                    // its accepted namespace observation for guarded deletion;
+                    // never bind that old identity onto the replacement.
                     return WorkResult::Complete;
                 }
                 let entry = snapshot_entry(&self.root, path, &full, work.is_dir);
@@ -466,16 +535,41 @@ impl CfapiWork {
         };
         let key = fence_lookup_key(Some(intent.object_id()), Some(revision))
             .expect("complete mutation identity");
-        match self.record_fence(
-            key,
-            RevisionFence {
-                object_id: intent.object_id().to_owned(),
-                revision: revision.to_owned(),
-            },
-        ) {
+        let recorded = self
+            .record_fence(
+                key,
+                RevisionFence {
+                    object_id: intent.object_id().to_owned(),
+                    revision: revision.to_owned(),
+                },
+            )
+            .and_then(|()| {
+                if let LocalMutation::Delete {
+                    path,
+                    object_id,
+                    revision,
+                    ..
+                } = intent
+                {
+                    let mut baseline = self.baseline.lock().unwrap_or_else(|e| e.into_inner());
+                    if baseline.get(path).is_some_and(|entry| {
+                        entry.object_id.as_deref() == Some(object_id)
+                            && entry.revision.as_deref() == Some(revision)
+                    }) {
+                        self.store.observe_paths::<PriorPath>(
+                            BASELINE_SCOPE,
+                            &[],
+                            std::slice::from_ref(path),
+                        )?;
+                        baseline.remove(path);
+                    }
+                }
+                Ok(())
+            });
+        match recorded {
             Ok(()) => WorkResult::Complete,
             Err(error) => {
-                WorkResult::Retry(format!("persisting completed mutation fence: {error:#}"))
+                WorkResult::Retry(format!("persisting completed mutation state: {error:#}"))
             }
         }
     }
@@ -1055,6 +1149,20 @@ impl Uploader for JournaledUploader {
             .unwrap_or_else(|err| err.into_inner())
             .get(path.trim_end_matches('/'))
             .cloned();
+        if observed.as_ref().is_some_and(|old| {
+            old.is_dir != path.ends_with('/') && old.object_id.is_some() && old.revision.is_some()
+        }) {
+            self.work
+                .enqueue_upload(path, object_id, revision, length)?;
+            self.work
+                .stage_kind_replacement(path, path.ends_with('/'))?;
+            anyhow::bail!("kind replacement is waiting for guarded namespace removal: {path}");
+        }
+        if is_protected(path.trim_end_matches('/'), &self.work.protected_paths()?) {
+            self.work
+                .enqueue_upload(path, object_id, revision, length)?;
+            anyhow::bail!("upload is waiting for its pending namespace operation: {path}");
+        }
         if let Some(observed) = observed
             && observed.object_id.as_deref().is_some()
             && (observed.object_id.as_deref() != object_id
@@ -1064,13 +1172,8 @@ impl Uploader for JournaledUploader {
                 "upload identity advanced; reconcile current receipt before retrying {path}"
             );
         }
-        let job = PlannedWork::new(
-            path,
-            format!("upload:{}", object_id.unwrap_or(path)),
-            serde_json::json!({"path":path,"object_id":object_id,"revision":revision,"length":length}),
-        );
-        self.work.store.enqueue(UPLOAD_SCOPE, &[job])?;
-        self.work.notify();
+        self.work
+            .enqueue_upload(path, object_id, revision, length)?;
         self.work.store.rearm_completed(UPLOAD_SCOPE, path)?;
         let Some(lease) = self
             .work
@@ -1323,6 +1426,253 @@ mod tests {
             remote_media: None,
         }
     }
+    #[test]
+    fn accepted_old_kind_receipt_preserves_replacement_and_accepted_delete_identity() {
+        for old_directory in [false, true] {
+            let (sync_root, provider) =
+                super::super::tests::registered_monitor_test_sync_root("receipt-kind-replacement");
+            if old_directory {
+                std::fs::write(sync_root.root_path.join("entry"), b"new local file").unwrap();
+            } else {
+                std::fs::create_dir(sync_root.root_path.join("entry")).unwrap();
+            }
+            let work = CfapiWork::new(
+                sync_root.root_path.clone(),
+                provider,
+                WorkStore::open(":memory:").unwrap(),
+                RemoteAppliedTracker::default(),
+            )
+            .unwrap();
+            work.record_accepted_receipt(
+                if old_directory { "entry/" } else { "entry" },
+                Some("old-object"),
+                Some("r1"),
+                &crate::runtime::UploadReceipt {
+                    object_id: Some("old-object".into()),
+                    remote_version: Some("accepted-r2".into()),
+                    in_sync_content_fingerprint: None,
+                },
+            )
+            .unwrap();
+            work.drain_upload_receipts().unwrap();
+            let current = snapshot_entry(
+                &sync_root.root_path,
+                "entry",
+                &sync_root.root_path.join("entry"),
+                !old_directory,
+            );
+            assert!(
+                current.placeholder_object_id.is_none(),
+                "an old accepted receipt must not bind another kind: {}",
+                current.to_log_string()
+            );
+            assert_eq!(
+                work.prior()["entry"].revision.as_deref(),
+                Some("accepted-r2"),
+                "accepted remote identity remains available for guarded removal"
+            );
+            if old_directory {
+                assert_eq!(
+                    std::fs::read(sync_root.root_path.join("entry")).unwrap(),
+                    b"new local file"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn production_uploader_guards_kind_replacement_before_creating_new_object() {
+        struct KindUploader {
+            live: Mutex<BTreeSet<String>>,
+            deleted: Mutex<Vec<String>>,
+            uploaded: Mutex<Vec<String>>,
+        }
+        impl Uploader for KindUploader {
+            fn upload_reader(
+                &self,
+                _: &str,
+                _: &mut dyn std::io::Read,
+                _: u64,
+            ) -> Result<crate::runtime::UploadReceipt> {
+                anyhow::bail!("unexpected unguarded upload")
+            }
+            fn upload_reader_for_object(
+                &self,
+                path: &str,
+                id: Option<&str>,
+                rev: Option<&str>,
+                reader: &mut dyn std::io::Read,
+                _: u64,
+            ) -> Result<crate::runtime::UploadReceipt> {
+                assert!(
+                    self.live.lock().unwrap().is_empty(),
+                    "new kind uploaded before old namespace was removed"
+                );
+                assert!(
+                    id.is_none() && rev.is_none(),
+                    "replacement must create its own identity"
+                );
+                let mut bytes = Vec::new();
+                reader.read_to_end(&mut bytes)?;
+                self.uploaded.lock().unwrap().push(path.to_owned());
+                Ok(crate::runtime::UploadReceipt {
+                    object_id: Some("replacement-object".into()),
+                    remote_version: Some("replacement-r1".into()),
+                    in_sync_content_fingerprint: None,
+                })
+            }
+            fn delete_object(&self, id: &str, rev: &str) -> Result<()> {
+                assert_eq!(rev, "r1");
+                let mut live = self.live.lock().unwrap();
+                if id == "old-directory" && live.iter().any(|id| id.ends_with("child")) {
+                    return Err(client_sdk::ObjectMutationConflict::new(
+                        "delete",
+                        "directory has a live child",
+                    )
+                    .into());
+                }
+                assert!(live.remove(id));
+                self.deleted.lock().unwrap().push(id.to_owned());
+                Ok(())
+            }
+        }
+        for (old_directory, unseen_child) in [(false, false), (true, false), (true, true)] {
+            let (sync_root, provider) =
+                super::super::tests::registered_monitor_test_sync_root("wrapped-kind-replacement");
+            let old_id = if old_directory {
+                "old-directory"
+            } else {
+                "old-file"
+            };
+            let actions = if old_directory {
+                vec![
+                    CfapiAction::EnsureDirectory {
+                        object_id: Some(old_id.into()),
+                        path: "entry".into(),
+                        remote_version: Some("r1".into()),
+                    },
+                    CfapiAction::EnsurePlaceholder {
+                        object_id: Some("known-child".into()),
+                        path: "entry/child".into(),
+                        remote_version: "r1".into(),
+                        remote_content_hash: "hash".into(),
+                        remote_size: Some(1),
+                        remote_content_fingerprint: None,
+                        remote_modified_at_unix: None,
+                        remote_media: None,
+                    },
+                ]
+            } else {
+                vec![CfapiAction::EnsurePlaceholder {
+                    object_id: Some(old_id.into()),
+                    path: "entry".into(),
+                    remote_version: "r1".into(),
+                    remote_content_hash: "hash".into(),
+                    remote_size: Some(1),
+                    remote_content_fingerprint: None,
+                    remote_modified_at_unix: None,
+                    remote_media: None,
+                }]
+            };
+            crate::runtime::apply_action_plan(
+                &sync_root.root_path,
+                &CfapiActionPlan { actions },
+                provider,
+                true,
+            )
+            .unwrap();
+            let mut live = BTreeSet::from([old_id.to_owned()]);
+            if old_directory {
+                live.insert("known-child".into());
+            }
+            if unseen_child {
+                live.insert("unseen-child".into());
+            }
+            let inner = Arc::new(KindUploader {
+                live: Mutex::new(live),
+                deleted: Mutex::default(),
+                uploaded: Mutex::default(),
+            });
+            let journal = WorkStore::open(root().join("work.sqlite")).unwrap();
+            let mut monitor = SyncRootMonitor::from_store(
+                "test",
+                sync_root.root_path.clone(),
+                provider,
+                inner.clone(),
+                journal.clone(),
+            )
+            .unwrap();
+            monitor.uploader = Arc::new(JournaledUploader {
+                inner: inner.clone(),
+                work: monitor.work.clone(),
+            });
+            monitor.prepare_startup().unwrap();
+            if old_directory {
+                std::fs::remove_dir_all(sync_root.root_path.join("entry")).unwrap();
+                std::fs::write(sync_root.root_path.join("entry"), b"replacement bytes").unwrap();
+            } else {
+                std::fs::remove_file(sync_root.root_path.join("entry")).unwrap();
+                std::fs::create_dir(sync_root.root_path.join("entry")).unwrap();
+            }
+            let upload_path = if old_directory { "entry" } else { "entry/" };
+            let payload: &[u8] = if old_directory {
+                b"replacement bytes"
+            } else {
+                b"<DIR>"
+            };
+            assert!(
+                monitor
+                    .uploader
+                    .upload_reader_for_object(
+                        upload_path,
+                        None,
+                        None,
+                        &mut std::io::Cursor::new(payload),
+                        payload.len() as u64
+                    )
+                    .is_err()
+            );
+            assert!(
+                monitor.work.pending_uploads().unwrap().contains("entry"),
+                "callback before scan must retain replacement upload across restart"
+            );
+            drop(monitor);
+            let mut reopened = SyncRootMonitor::from_store(
+                "test",
+                sync_root.root_path.clone(),
+                provider,
+                inner.clone(),
+                journal,
+            )
+            .unwrap();
+            reopened.uploader = Arc::new(JournaledUploader {
+                inner: inner.clone(),
+                work: reopened.work.clone(),
+            });
+            reopened.prepare_startup().unwrap();
+            reopened.try_walk().unwrap();
+            reopened.try_walk().unwrap();
+            if unseen_child {
+                assert!(inner.uploaded.lock().unwrap().is_empty());
+                assert_eq!(reopened.work.status().unwrap().conflicts, 1);
+                assert_eq!(
+                    std::fs::read(sync_root.root_path.join("entry")).unwrap(),
+                    payload
+                );
+                assert!(inner.live.lock().unwrap().contains("unseen-child"));
+            } else {
+                assert_eq!(*inner.uploaded.lock().unwrap(), vec![upload_path]);
+                assert!(inner.live.lock().unwrap().is_empty());
+                if old_directory {
+                    assert_eq!(
+                        *inner.deleted.lock().unwrap(),
+                        vec!["known-child", "old-directory"]
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn deleting_pending_directory_rename_gates_marker_on_children_and_protects_original_ids() {
         let work = CfapiWork::new(
