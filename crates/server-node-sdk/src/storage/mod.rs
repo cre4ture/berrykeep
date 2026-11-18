@@ -2182,6 +2182,16 @@ pub(super) fn sqlite_like_prefix_pattern(prefix: &str) -> String {
     pattern
 }
 
+/// Directory markers end in ASCII '/'. Replacing that final byte with its
+/// successor bounds precisely their descendants under the key index's binary
+/// ordering, including literal SQL wildcard characters and Unicode names.
+pub(super) fn directory_descendant_upper_bound(directory_key: &str) -> Result<String> {
+    let stem = directory_key
+        .strip_suffix('/')
+        .ok_or_else(|| anyhow::anyhow!("directory marker key must end in '/': {directory_key}"))?;
+    Ok(format!("{stem}0"))
+}
+
 pub(crate) fn gallery_media_type_for_path(path: &str) -> Option<&'static str> {
     let extension = path
         .rsplit('.')
@@ -3045,6 +3055,7 @@ trait MetadataStore: Send + Sync {
     ) -> Result<Option<std::result::Result<GalleryDeltaPage, GalleryDeltaCursorError>>>;
     async fn count_current_objects(&self) -> Result<usize>;
     async fn list_current_object_keys(&self) -> Result<Vec<String>>;
+    async fn has_current_object_descendants(&self, directory_key: &str) -> Result<bool>;
     async fn list_keys_for_object_id(&self, object_id: &str) -> Result<Vec<String>>;
     async fn load_repair_attempts(&self) -> Result<HashMap<String, RepairAttemptRecord>>;
     async fn persist_repair_attempts(
@@ -5740,6 +5751,12 @@ impl PersistentStore {
 
     pub async fn current_keys(&self) -> Result<Vec<String>> {
         self.metadata_store.list_current_object_keys().await
+    }
+
+    pub async fn has_current_object_descendants(&self, directory_key: &str) -> Result<bool> {
+        self.metadata_store
+            .has_current_object_descendants(directory_key)
+            .await
     }
 
     /// Dashboard attribution for the resident `current_objects_cache`: how many entries
