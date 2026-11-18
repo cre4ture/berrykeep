@@ -335,6 +335,16 @@ fn schedule_remote_snapshot<B: FolderAgentLocalBackend>(
             }
         }
         if !payload.precondition_recorded {
+            if payload.entry.is_none()
+                && let Some(baseline) = baseline.as_ref()
+            {
+                // A delayed echo of our own delete can arrive after the user
+                // creates a new local path. Absence alone grants no permission
+                // to delete it or block its upload. Retain actual prior remote
+                // or synced-baseline evidence for genuine deletion retries.
+                payload.remote_known |= baseline.contains_key(&payload.path);
+                payload.preserve |= !payload.remote_known;
+            }
             payload.initial_local = backend.local_entry_state(options, &payload.path)?;
             if payload
                 .initial_local

@@ -51,6 +51,9 @@ An unchanged remote echo is recognized against the persisted synced content
 fingerprint (or directory kind) and durably classified as a no-op when scheduled.
 Local edits, deletions and type replacements, including changes after enqueue,
 remain for the local executor rather than becoming blocked remote conflicts.
+Remote deletion requires prior remote-namespace or synced-baseline evidence.
+A delayed deletion echo for an already-absent remote path cannot block a new
+local replacement waiting for upload.
 A genuinely changed remote child under a missing or replaced local directory
 still requires conflict resolution; it cannot recreate that directory over the
 user's replacement. Jobs retain and recheck baseline-known parent directories

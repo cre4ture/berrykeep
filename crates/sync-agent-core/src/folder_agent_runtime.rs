@@ -3954,6 +3954,77 @@ mod tests {
     }
 
     #[test]
+    fn remote_delete_requires_prior_remote_or_synced_baseline_evidence() {
+        for (synced_before, locally_changed) in [(false, false), (true, false), (true, true)] {
+            let root = crate::test_support::test_root();
+            let scope = PathScope::new(None);
+            let state = StartupStateStore::new_with_state_root(
+                &root,
+                &scope,
+                "http://127.0.0.1:1",
+                &root.join("state"),
+            );
+            let original = LocalEntryState {
+                kind: LocalEntryKind::File,
+                size_bytes: 16,
+                modified_unix_ms: 1,
+            };
+            if synced_before {
+                state
+                    .upsert_baseline_entry_with_hash("item", &original, Some("synced"))
+                    .unwrap();
+            }
+            let mut backend = RecordingBackend::default();
+            backend.local_entries.insert(
+                "item".into(),
+                LocalEntryState {
+                    modified_unix_ms: if locally_changed { 2 } else { 1 },
+                    ..original
+                },
+            );
+            backend.fingerprints.insert(
+                "item".into(),
+                if locally_changed { "edited" } else { "synced" }.into(),
+            );
+            let journal = crate::sync_work::WorkStore::open(root.join("work.sqlite")).unwrap();
+            let mut options = test_runtime_options();
+            options.run_once = false;
+            apply_remote_snapshot_with_journal(
+                &journal,
+                &mut backend,
+                &options,
+                &BerryKeepClient::from_direct_base_url("http://127.0.0.1:1"),
+                &SyncSnapshot::default(),
+                None,
+                Some(&["item".into()]),
+                None,
+                None,
+                Some(&state),
+                &scope,
+                &mut BTreeMap::new(),
+                &mut RemoteTreeIndex::default(),
+                None,
+                None,
+            )
+            .unwrap();
+            let conflict = synced_before && locally_changed;
+            let removed = synced_before && !locally_changed;
+            assert_eq!(
+                journal.status("folder-materialization").unwrap().conflicts,
+                u64::from(conflict)
+            );
+            assert_eq!(backend.local_entries.contains_key("item"), !removed);
+            assert_eq!(backend.operations.len(), usize::from(removed));
+            assert_eq!(
+                materialization::blocked_local_paths(&journal)
+                    .unwrap()
+                    .is_empty(),
+                !conflict
+            );
+        }
+    }
+
+    #[test]
     fn delayed_startup_work_preserves_offline_and_new_local_files() {
         let root = crate::test_support::test_root();
         let journal = crate::sync_work::WorkStore::open(root.join("work.sqlite")).unwrap();
