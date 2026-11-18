@@ -28,6 +28,8 @@ struct FolderWork {
     #[serde(default)]
     baseline_conflict: bool,
     #[serde(default)]
+    existing_parent_directories: Vec<String>,
+    #[serde(default)]
     resolution: Option<crate::ConflictResolutionStrategy>,
     #[serde(default)]
     delete_conflict_copies: bool,
@@ -165,6 +167,7 @@ pub(super) fn folder_materialization_plan(
             initial_fingerprint: None,
             subtree: BTreeMap::new(),
             baseline_conflict: false,
+            existing_parent_directories: Vec::new(),
             resolution: None,
             delete_conflict_copies: false,
         };
@@ -341,11 +344,11 @@ fn schedule_remote_snapshot<B: FolderAgentLocalBackend>(
                 payload.initial_fingerprint =
                     Some(backend.file_content_fingerprint(options, &payload.path)?);
             }
-            // A first notification of our own upload can arrive after the user
-            // has already edited, removed or replaced the local path. If the
-            // remote content still equals the synced baseline, there is no
-            // remote change to apply. Leave the baseline intact for local sync.
-            if let Some(baseline) = baseline.as_ref()
+            // An unchanged remote echo never authorizes filesystem work. Persist
+            // that decision even when the local path still matches here: the user
+            // may edit, remove or replace it before the job is executed.
+            if payload.resolution.is_none()
+                && let Some(baseline) = baseline.as_ref()
                 && let Some(synced) = baseline.get(&payload.path)
                 && let Some(remote) = payload.entry.as_ref()
             {
@@ -358,17 +361,7 @@ fn schedule_remote_snapshot<B: FolderAgentLocalBackend>(
                         .is_some_and(|hash| baseline_hashes.get(&payload.path) == Some(hash));
                 let same_remote_directory =
                     synced.kind == LocalEntryKind::Directory && remote.kind == EntryKind::Directory;
-                let locally_changed = payload.initial_local.as_ref() != Some(synced)
-                    || payload
-                        .initial_fingerprint
-                        .as_ref()
-                        .is_some_and(|hash| baseline_hashes.get(&payload.path) != Some(hash));
-                payload.preserve |= (same_remote_file && locally_changed)
-                    || (same_remote_directory
-                        && payload
-                            .initial_local
-                            .as_ref()
-                            .is_none_or(|entry| entry.kind != LocalEntryKind::Directory));
+                payload.preserve |= same_remote_file || same_remote_directory;
             }
             if payload
                 .initial_local
@@ -443,12 +436,14 @@ fn schedule_remote_snapshot<B: FolderAgentLocalBackend>(
                 if baseline
                     .get(&parent)
                     .is_some_and(|entry| entry.kind == LocalEntryKind::Directory)
-                    && backend
+                {
+                    payload.existing_parent_directories.push(parent.clone());
+                    if backend
                         .local_entry_state(options, &parent)?
                         .is_none_or(|entry| entry.kind != LocalEntryKind::Directory)
-                {
-                    payload.baseline_conflict = true;
-                    break;
+                    {
+                        payload.baseline_conflict = true;
+                    }
                 }
             }
         }
@@ -519,6 +514,18 @@ pub(super) fn drain_remote_work<B: FolderAgentLocalBackend>(
                 }
                 if work.preserve {
                     return Ok(());
+                }
+                for parent in &work.existing_parent_directories {
+                    if backend
+                        .local_entry_state(options, parent)?
+                        .is_none_or(|entry| entry.kind != LocalEntryKind::Directory)
+                    {
+                        conflict = true;
+                        anyhow::bail!(
+                            "parent directory {parent} was removed or replaced; restore it before applying remote work for {}",
+                            work.path
+                        );
+                    }
                 }
                 let mut current = backend.local_entry_state(options, &work.path)?;
                 if let Some(entry) = work

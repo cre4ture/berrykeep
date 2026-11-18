@@ -41,11 +41,14 @@ jobs. They never infer deletions from a cached snapshot or replace upload-known
 remote state. Unchanged completed jobs retain their original payload, so an
 unrelated remote update cannot recreate a local deletion before it is observed.
 An unchanged remote echo is recognized against the persisted synced content
-fingerprint (or directory kind). Local edits, deletions and type replacements
+fingerprint (or directory kind) and durably classified as a no-op when scheduled.
+Local edits, deletions and type replacements, including changes after enqueue,
 remain for the local executor rather than becoming blocked remote conflicts.
 A genuinely changed remote child under a missing or replaced local directory
 still requires conflict resolution; it cannot recreate that directory over the
-user's replacement.
+user's replacement. Jobs retain and recheck baseline-known parent directories
+before execution. A child-only resolution cannot authorize replacing a different
+local ancestor; restore that directory before resolving the child.
 Successful per-path baselines are persisted incrementally; backed-off work does
 not refresh the last-success timestamp or rewrite the whole baseline.
 
