@@ -54,6 +54,9 @@ remote state. Unchanged completed jobs retain their original payload, so an
 unrelated remote update cannot recreate a local deletion before it is observed.
 An unchanged remote echo is recognized against the persisted synced content
 fingerprint (or directory kind) and durably classified as a no-op when scheduled.
+Completed work also retains its decision when the same object revision later
+gains media, timestamp, or fingerprint metadata. Metadata enrichment alone cannot
+reschedule an old revision over a newer local type replacement.
 Local edits, deletions and type replacements, including changes after enqueue,
 remain for the local executor rather than becoming blocked remote conflicts.
 Remote deletion requires prior remote-namespace or synced-baseline evidence.

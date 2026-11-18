@@ -4443,6 +4443,131 @@ mod tests {
     }
 
     #[test]
+    fn metadata_enrichment_cannot_rearm_an_old_revision_after_a_local_kind_replacement() {
+        for (change, has_revision) in [
+            ("metadata", true),
+            ("metadata", false),
+            ("revision", true),
+            ("revision", false),
+            ("identity", true),
+            ("identity", false),
+            ("content", false),
+        ] {
+            let root = crate::test_support::test_root();
+            let scope = PathScope::new(None);
+            let state = StartupStateStore::new_with_state_root(
+                &root,
+                &scope,
+                "http://127.0.0.1:1",
+                &root.join("state"),
+            );
+            let original = LocalEntryState {
+                kind: LocalEntryKind::File,
+                size_bytes: 7,
+                modified_unix_ms: 1,
+            };
+            state
+                .upsert_baseline_entry_with_hash("item", &original, Some("synced"))
+                .unwrap();
+            let mut backend = RecordingBackend::default();
+            backend.local_entries.insert("item".into(), original);
+            backend.fingerprints.insert("item".into(), "synced".into());
+            let journal = crate::sync_work::WorkStore::open(root.join("work.sqlite")).unwrap();
+            let mut remote = sync_core::NamespaceEntry::file("item", "r1", "synced");
+            remote.object_id = Some("original-object".into());
+            remote.version = has_revision.then(|| "r1".into());
+            let mut snapshot = SyncSnapshot {
+                local: vec![],
+                remote: vec![remote],
+            };
+            let mut options = test_runtime_options();
+            options.run_once = false;
+            let client = BerryKeepClient::from_direct_base_url("http://127.0.0.1:1");
+            let mut index = RemoteTreeIndex::default();
+            let mut suppressed = BTreeMap::new();
+            apply_remote_snapshot_with_journal(
+                &journal,
+                &mut backend,
+                &options,
+                &client,
+                &snapshot,
+                None,
+                None,
+                None,
+                None,
+                Some(&state),
+                &scope,
+                &mut suppressed,
+                &mut index,
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                journal.status("folder-materialization").unwrap().completed,
+                1
+            );
+            let replacement = LocalEntryState {
+                kind: LocalEntryKind::Directory,
+                size_bytes: 0,
+                modified_unix_ms: 2,
+            };
+            backend
+                .local_entries
+                .insert("item".into(), replacement.clone());
+            state.upsert_baseline_entry("item", &replacement).unwrap();
+            index.files.remove("item");
+            index.directories.insert("item".into());
+            let remote = &mut snapshot.remote[0];
+            remote.modified_at_unix = Some(123);
+            remote.content_fingerprint = Some("synced".into());
+            remote.media = Some(sync_core::NamespaceMediaMetadata {
+                mime_type: Some("text/plain".into()),
+                ..Default::default()
+            });
+            if change == "revision" {
+                remote.version = Some("r2".into());
+            }
+            if change == "identity" {
+                remote.object_id = Some("replacement-object".into());
+            }
+            if change == "content" {
+                remote.content_fingerprint = Some("new-content".into());
+            }
+            apply_remote_snapshot_with_journal(
+                &journal,
+                &mut backend,
+                &options,
+                &client,
+                &snapshot,
+                None,
+                Some(&["item".into()]),
+                None,
+                None,
+                Some(&state),
+                &scope,
+                &mut suppressed,
+                &mut index,
+                None,
+                None,
+            )
+            .unwrap();
+            let expected = if change == "metadata" {
+                LocalEntryKind::Directory
+            } else {
+                LocalEntryKind::File
+            };
+            assert_eq!(backend.local_entries["item"].kind, expected, "{change}");
+            assert_eq!(
+                state.load_local_baseline().unwrap()["item"].kind,
+                expected,
+                "{change}"
+            );
+            assert_eq!(backend.operations.is_empty(), change == "metadata");
+        }
+    }
+
+    #[test]
     fn unchanged_remote_echo_scheduled_before_local_changes_never_blocks_them() {
         for (original_kind, replacement_kind) in [
             (LocalEntryKind::File, Some(LocalEntryKind::Directory)),

@@ -329,7 +329,7 @@ fn schedule_remote_snapshot<B: FolderAgentLocalBackend>(
         let mut payload: FolderWork = serde_json::from_value(item.payload.clone())?;
         if let Some(previous) = previous.get(&item.key) {
             let previous_work: FolderWork = serde_json::from_value(previous.clone())?;
-            if previous_work.entry == payload.entry {
+            if same_remote_materialization(previous_work.entry.as_ref(), payload.entry.as_ref()) {
                 item.payload = previous.clone();
                 continue;
             }
@@ -467,6 +467,48 @@ fn schedule_remote_snapshot<B: FolderAgentLocalBackend>(
         }
     }
     Ok(())
+}
+
+/// Namespace revisions identify immutable content. Enriching cached metadata
+/// cannot grant permission to replay an old completed filesystem operation.
+fn same_remote_materialization(
+    previous: Option<&sync_core::NamespaceEntry>,
+    current: Option<&sync_core::NamespaceEntry>,
+) -> bool {
+    let (Some(previous), Some(current)) = (previous, current) else {
+        return previous.is_none() && current.is_none();
+    };
+    if previous.path != current.path
+        || previous.kind != current.kind
+        || previous.object_id != current.object_id
+        || previous.version != current.version
+    {
+        return false;
+    }
+    if previous.object_id.as_ref().is_some_and(|id| !id.is_empty())
+        && previous
+            .version
+            .as_ref()
+            .is_some_and(|revision| !revision.is_empty())
+    {
+        return true;
+    }
+    fn fingerprint(entry: &sync_core::NamespaceEntry) -> Option<&str> {
+        entry
+            .content_fingerprint
+            .as_deref()
+            .filter(|hash| !hash.is_empty())
+            .or_else(|| {
+                entry
+                    .content_hash
+                    .as_deref()
+                    .filter(|hash| !hash.is_empty())
+            })
+    }
+    match (fingerprint(previous), fingerprint(current)) {
+        (Some(previous_hash), Some(current_hash)) => previous_hash == current_hash,
+        _ => previous == current,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
