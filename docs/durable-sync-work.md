@@ -40,6 +40,12 @@ Authoritative snapshots schedule folder work; retry passes only drain persisted
 jobs. They never infer deletions from a cached snapshot or replace upload-known
 remote state. Unchanged completed jobs retain their original payload, so an
 unrelated remote update cannot recreate a local deletion before it is observed.
+An unchanged remote echo is recognized against the persisted synced content
+fingerprint (or directory kind). Local edits, deletions and type replacements
+remain for the local executor rather than becoming blocked remote conflicts.
+A genuinely changed remote child under a missing or replaced local directory
+still requires conflict resolution; it cannot recreate that directory over the
+user's replacement.
 Successful per-path baselines are persisted incrementally; backed-off work does
 not refresh the last-success timestamp or rewrite the whole baseline.
 

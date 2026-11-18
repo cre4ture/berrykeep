@@ -4236,6 +4236,119 @@ mod tests {
     }
 
     #[test]
+    fn unchanged_remote_echo_does_not_block_local_kind_changes_or_recreate_old_children() {
+        for remote_child_changed in [false, true] {
+            let root = crate::test_support::test_root();
+            let state = StartupStateStore::new_with_state_root(
+                &root,
+                &PathScope::new(None),
+                "http://127.0.0.1:1",
+                &root.join("state"),
+            );
+            let journal = crate::sync_work::WorkStore::open(root.join("work.sqlite")).unwrap();
+            let file = LocalEntryState {
+                kind: LocalEntryKind::File,
+                size_bytes: 7,
+                modified_unix_ms: 1,
+            };
+            let directory = LocalEntryState {
+                kind: LocalEntryKind::Directory,
+                size_bytes: 0,
+                modified_unix_ms: 1,
+            };
+            state
+                .upsert_baseline_entry_with_hash("file-to-dir", &file, Some("synced-file"))
+                .unwrap();
+            state
+                .upsert_baseline_entry("dir-to-file", &directory)
+                .unwrap();
+            state
+                .upsert_baseline_entry("deleted-empty", &directory)
+                .unwrap();
+            state
+                .upsert_baseline_entry_with_hash("dir-to-file/old", &file, Some("synced-child"))
+                .unwrap();
+            let baseline = state.load_local_baseline().unwrap();
+            let mut local_state = baseline.clone();
+            let mut backend = RecordingBackend::default();
+            backend
+                .local_entries
+                .insert("file-to-dir".into(), directory);
+            backend
+                .local_entries
+                .insert("file-to-dir/new".into(), file.clone());
+            backend.local_entries.insert("dir-to-file".into(), file);
+            let before = backend.local_entries.clone();
+            let snapshot = SyncSnapshot {
+                local: vec![],
+                remote: vec![
+                    sync_core::NamespaceEntry::file("file-to-dir", "r1", "synced-file"),
+                    sync_core::NamespaceEntry::directory("dir-to-file"),
+                    sync_core::NamespaceEntry::directory("deleted-empty"),
+                    sync_core::NamespaceEntry::file(
+                        "dir-to-file/old",
+                        "r1",
+                        if remote_child_changed {
+                            "changed-remote-child"
+                        } else {
+                            "synced-child"
+                        },
+                    ),
+                ],
+            };
+            let mut index = RemoteTreeIndex::default();
+            index
+                .files
+                .extend(["file-to-dir".into(), "dir-to-file/old".into()]);
+            index.directories.insert("dir-to-file".into());
+            index.directories.insert("deleted-empty".into());
+            let mut options = test_runtime_options();
+            options.run_once = false;
+            let changed = vec![
+                "file-to-dir".into(),
+                "dir-to-file".into(),
+                "dir-to-file/old".into(),
+                "deleted-empty".into(),
+            ];
+            apply_remote_snapshot_with_journal(
+                &journal,
+                &mut backend,
+                &options,
+                &BerryKeepClient::from_direct_base_url("http://127.0.0.1:1"),
+                &snapshot,
+                Some(&mut local_state),
+                Some(&changed),
+                None,
+                None,
+                Some(&state),
+                &PathScope::new(None),
+                &mut BTreeMap::new(),
+                &mut index,
+                None,
+                None,
+            )
+            .unwrap();
+            assert!(
+                backend.operations.is_empty(),
+                "stale echo must not touch local paths: {:?}",
+                backend.operations
+            );
+            assert_eq!(backend.local_entries, before);
+            assert_eq!(
+                state.load_local_baseline().unwrap(),
+                baseline,
+                "local scan still needs the old baseline to propagate the user's changes"
+            );
+            assert_eq!(
+                journal.status("folder-materialization").unwrap().conflicts,
+                u64::from(remote_child_changed)
+            );
+            let blocked = materialization::blocked_local_paths(&journal).unwrap();
+            assert_eq!(blocked.is_empty(), !remote_child_changed);
+        }
+    }
+
+    #[test]
     fn remote_delete_preserves_content_edited_before_the_job_was_scheduled() {
         let root = crate::test_support::test_root();
         let scope = PathScope::new(None);

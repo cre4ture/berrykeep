@@ -341,6 +341,35 @@ fn schedule_remote_snapshot<B: FolderAgentLocalBackend>(
                 payload.initial_fingerprint =
                     Some(backend.file_content_fingerprint(options, &payload.path)?);
             }
+            // A first notification of our own upload can arrive after the user
+            // has already edited, removed or replaced the local path. If the
+            // remote content still equals the synced baseline, there is no
+            // remote change to apply. Leave the baseline intact for local sync.
+            if let Some(baseline) = baseline.as_ref()
+                && let Some(synced) = baseline.get(&payload.path)
+                && let Some(remote) = payload.entry.as_ref()
+            {
+                let same_remote_file = synced.kind == LocalEntryKind::File
+                    && remote.kind == EntryKind::File
+                    && remote
+                        .content_fingerprint
+                        .as_ref()
+                        .or(remote.content_hash.as_ref())
+                        .is_some_and(|hash| baseline_hashes.get(&payload.path) == Some(hash));
+                let same_remote_directory =
+                    synced.kind == LocalEntryKind::Directory && remote.kind == EntryKind::Directory;
+                let locally_changed = payload.initial_local.as_ref() != Some(synced)
+                    || payload
+                        .initial_fingerprint
+                        .as_ref()
+                        .is_some_and(|hash| baseline_hashes.get(&payload.path) != Some(hash));
+                payload.preserve |= (same_remote_file && locally_changed)
+                    || (same_remote_directory
+                        && payload
+                            .initial_local
+                            .as_ref()
+                            .is_none_or(|entry| entry.kind != LocalEntryKind::Directory));
+            }
             if payload
                 .initial_local
                 .as_ref()
@@ -349,6 +378,7 @@ fn schedule_remote_snapshot<B: FolderAgentLocalBackend>(
                     .entry
                     .as_ref()
                     .is_none_or(|entry| entry.kind != EntryKind::Directory)
+                && !payload.preserve
             {
                 let prefix = format!("{}/", payload.path);
                 if captured_tree.is_none() {
@@ -378,6 +408,7 @@ fn schedule_remote_snapshot<B: FolderAgentLocalBackend>(
             payload.precondition_recorded = true;
             if let Some(baseline) = baseline.as_ref()
                 && let Some(current) = payload.initial_local.as_ref()
+                && !payload.preserve
             {
                 let same_kind_directory = current.kind == LocalEntryKind::Directory
                     && payload
@@ -405,13 +436,16 @@ fn schedule_remote_snapshot<B: FolderAgentLocalBackend>(
             }
         }
         if payload.entry.is_some()
+            && !payload.preserve
             && let Some(baseline) = baseline.as_ref()
         {
             for parent in parent_directories(&payload.path) {
                 if baseline
                     .get(&parent)
                     .is_some_and(|entry| entry.kind == LocalEntryKind::Directory)
-                    && backend.local_entry_state(options, &parent)?.is_none()
+                    && backend
+                        .local_entry_state(options, &parent)?
+                        .is_none_or(|entry| entry.kind != LocalEntryKind::Directory)
                 {
                     payload.baseline_conflict = true;
                     break;
