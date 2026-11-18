@@ -213,7 +213,8 @@ jobs:
 
   web-smoke-tests:
     name: Web (${{ matrix.suite.label }})
-    runs-on: ubuntu-latest
+    # Keep the browser host within the locked Playwright version's supported OSes.
+    runs-on: ubuntu-24.04
     needs: workspace-check
     timeout-minutes: 45
     strategy:
