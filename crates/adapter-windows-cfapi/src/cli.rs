@@ -81,7 +81,11 @@ fn publish_work_status(
         } else {
             "Local and remote state are aligned".to_owned()
         };
-        publisher.update_sync_state(state, headline, detail, "folder-saved-search-symbolic")?;
+        if let Err(error) =
+            publisher.update_sync_state(state, headline, detail, "folder-saved-search-symbolic")
+        {
+            tracing::warn!("windows-status: failed to persist sync work status: {error:#}");
+        }
     }
     Ok(())
 }
@@ -1020,7 +1024,35 @@ fn resolve_cli_relative_path(root_path: &std::path::Path, requested_path: &str) 
 
 #[cfg(test)]
 mod tests {
-    use super::{PinHydrationSnapshot, should_request_pin_hydration};
+    use super::*;
+
+    #[test]
+    fn failed_status_file_write_does_not_fail_journal_status_publication() {
+        let root =
+            std::env::temp_dir().join(format!("berrykeep-status-failure-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let status_file = root.join("status.json");
+        let publisher = WindowsStatusPublisher::new(&WindowsStatusOptions {
+            profile_label: "test".into(),
+            root_dir: root.clone(),
+            connection_target: "test".into(),
+            status_file: status_file.clone(),
+        })
+        .unwrap();
+        std::fs::remove_file(&status_file).unwrap();
+        std::fs::create_dir(&status_file).unwrap();
+        let monitor = SyncRootMonitor::new(
+            "test",
+            root.clone(),
+            uuid::Uuid::nil(),
+            Arc::new(crate::runtime::DemoUploader),
+        );
+        assert!(
+            publish_work_status(Some(&publisher), &monitor.work()).is_ok(),
+            "a cosmetic publisher write failure must not stop the connected provider"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn pin_hydration_requests_initial_explicit_hydrate() {
