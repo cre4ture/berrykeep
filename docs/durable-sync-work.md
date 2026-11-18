@@ -82,6 +82,9 @@ Missing previously observed paths wait for a topology scan so
 background population cannot recreate an unobserved user deletion or rename.
 Partial batch success is recorded per path before acknowledgement; a failed
 first entry does not prevent independent siblings from being attempted.
+Implicit parent directories are derived from eligible children. A protected
+child deletion cannot recreate its empty implicit branch; explicit directory
+marker objects remain independently materializable.
 
 Deletes and moves retain object ID and expected revision. Accepted mutations
 leave revision fences so a snapshot fetched before replay cannot recreate or

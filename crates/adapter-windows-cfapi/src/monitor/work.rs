@@ -1078,7 +1078,15 @@ fn materialization_plan(
     let mut files: BTreeMap<String, Vec<CfapiAction>> = BTreeMap::new();
     for action in &plan.actions {
         let path = action_path(action);
-        if is_protected(path, protected) || matches!(action, CfapiAction::QueueUploadOnClose { .. })
+        if is_protected(path, protected)
+            || matches!(action, CfapiAction::QueueUploadOnClose { .. })
+            || matches!(
+                action,
+                CfapiAction::EnsureDirectory {
+                    object_id: None,
+                    ..
+                }
+            )
         {
             continue;
         }
@@ -1200,6 +1208,34 @@ mod tests {
             remote_media: None,
         }
     }
+    #[test]
+    fn implicit_parents_exist_only_for_eligible_children() {
+        let plan = CfapiActionPlan {
+            actions: vec![
+                CfapiAction::EnsureDirectory {
+                    object_id: None,
+                    path: "deleted-parent".into(),
+                    remote_version: None,
+                },
+                file("deleted-parent/a"),
+                CfapiAction::EnsureDirectory {
+                    object_id: Some("empty-marker".into()),
+                    path: "explicit-empty".into(),
+                    remote_version: Some("r1".into()),
+                },
+                file("other/a"),
+            ],
+        };
+        let jobs =
+            materialization_plan(&plan, &BTreeSet::from(["deleted-parent/a".into()])).unwrap();
+        assert!(
+            !jobs.iter().any(|job| job.key == "directory:deleted-parent"),
+            "pending child deletion must not recreate its empty implicit parent"
+        );
+        assert!(jobs.iter().any(|job| job.key == "directory:explicit-empty"));
+        assert!(jobs.iter().any(|job| job.key == "directory:other"));
+    }
+
     #[test]
     fn idle_work_wait_has_no_deadline_and_scheduling_cannot_lose_wakeup() {
         let work = CfapiWork::new(
