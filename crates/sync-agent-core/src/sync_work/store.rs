@@ -58,6 +58,7 @@ pub struct WorkStatus {
 pub struct WorkStore {
     connection: Arc<Mutex<Connection>>,
     path: PathBuf,
+    executor_owner: Option<Arc<std::fs::File>>,
 }
 
 // Only eligible work is indexed here. Completed jobs and blocked descendants are
@@ -70,6 +71,49 @@ const CLAIM_SQL:&str="SELECT w.key,w.resource,w.payload,w.dependencies,w.generat
     ORDER BY r.available_at,r.key LIMIT 1";
 
 impl WorkStore {
+    /// Production side-effect executors hold exclusive OS ownership of a journal.
+    /// Control connections may still read or authorize work using `open`.
+    /// Acquiring this lock proves that no prior executor remains alive, allowing
+    /// immediate recovery without stealing a live worker's resource lease.
+    pub fn open_for_executor(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        if path == Path::new(":memory:") {
+            bail!("executor ownership requires a persistent journal");
+        }
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+        let owner_path = path.with_extension("executor.lock");
+        let owner = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&owner_path)
+            .with_context(|| format!("opening sync executor ownership {}", owner_path.display()))?;
+        owner
+            .try_lock()
+            .with_context(|| format!("another sync executor owns {}", path.display()))?;
+        let mut store = Self::open(path)?;
+        store.executor_owner = Some(Arc::new(owner));
+        {
+            let mut connection = store.lock()?;
+            let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute("UPDATE sync_work SET state='pending',token=token+1,lease_until=0,available_at=0 WHERE state='running'", [])?;
+            tx.execute("DELETE FROM sync_work_resources", [])?;
+            tx.execute("DELETE FROM sync_work_ready", [])?;
+            tx.execute("INSERT INTO sync_work_ready(scope,key,available_at)
+                SELECT w.scope,w.key,w.available_at FROM sync_work w WHERE w.state='pending'
+                AND NOT EXISTS(SELECT 1 FROM sync_work_dependencies d LEFT JOIN sync_work p ON p.scope=d.scope AND p.key=d.dependency
+                    WHERE d.scope=w.scope AND d.key=w.key AND (p.state IS NULL OR p.state<>'complete'))", [])?;
+            tx.commit()?;
+        }
+        Ok(store)
+    }
+
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         if let Some(parent) = path
@@ -131,6 +175,7 @@ impl WorkStore {
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
             path: path.to_path_buf(),
+            executor_owner: None,
         })
     }
     pub fn path(&self) -> &Path {

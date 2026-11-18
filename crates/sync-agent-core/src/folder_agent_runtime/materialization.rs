@@ -43,7 +43,7 @@ fn journal(state: Option<&StartupStateStore>) -> Result<WorkStore> {
 }
 
 pub(super) fn open(state: &StartupStateStore) -> Result<WorkStore> {
-    let journal = WorkStore::open(state.path.with_file_name("sync-work.sqlite"))?;
+    let journal = WorkStore::open_for_executor(state.path.with_file_name("sync-work.sqlite"))?;
     journal.maintain(now_ms())?;
     Ok(journal)
 }

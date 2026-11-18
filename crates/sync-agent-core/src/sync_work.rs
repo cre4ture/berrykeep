@@ -21,6 +21,84 @@ mod tests {
     fn op(key: &str, value: u64) -> PlannedWork {
         PlannedWork::new(key, key, json!({"revision": value}))
     }
+
+    #[test]
+    fn executor_ownership_retains_live_claims_and_recovers_only_after_owner_stops() {
+        let (root, control) = store();
+        let path = root.join("work.sqlite");
+        let owner = WorkStore::open_for_executor(&path).unwrap();
+        owner.enqueue("intent", &[op("a", 1)]).unwrap();
+        let old = owner
+            .claim_next("intent", now_ms(), 120_000)
+            .unwrap()
+            .unwrap();
+        let retained = owner.clone();
+        drop(owner);
+        assert!(
+            WorkStore::open_for_executor(&path).is_err(),
+            "cloned executor must retain OS ownership"
+        );
+        assert!(
+            control
+                .claim_next("intent", now_ms(), 120_000)
+                .unwrap()
+                .is_none(),
+            "ordinary opens must not steal live claims"
+        );
+        drop(retained);
+        let recovered = WorkStore::open_for_executor(&path).unwrap();
+        let replay = recovered
+            .claim_next("intent", now_ms(), 120_000)
+            .unwrap()
+            .unwrap();
+        assert!(
+            !recovered
+                .finish(&old, WorkResult::Complete, now_ms())
+                .unwrap()
+        );
+        assert!(!recovered.renew(&old, now_ms(), 120_000).unwrap());
+        assert!(
+            recovered
+                .finish(&replay, WorkResult::Complete, now_ms())
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn executor_abrupt_exit_fixture() {
+        let Some(path) = std::env::var_os("BERRYKEEP_TEST_WORK_EXECUTOR_CRASH") else {
+            return;
+        };
+        let store = WorkStore::open_for_executor(path).unwrap();
+        store.enqueue("intent", &[op("crash", 7)]).unwrap();
+        assert!(
+            store
+                .claim_next("intent", now_ms(), 120_000)
+                .unwrap()
+                .is_some()
+        );
+        // Exit without running Rust destructors, as when the provider is killed.
+        std::process::exit(17);
+    }
+
+    #[test]
+    fn executor_recovers_immediately_after_process_exit_without_destructors() {
+        let (root, _) = store();
+        let path = root.join("work.sqlite");
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "sync_work::tests::executor_abrupt_exit_fixture"])
+            .env("BERRYKEEP_TEST_WORK_EXECUTOR_CRASH", &path)
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(17));
+        let recovered = WorkStore::open_for_executor(path).unwrap();
+        let lease = recovered
+            .claim_next("intent", now_ms(), 120_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(lease.work.payload, json!({"revision":7}));
+    }
+
     #[test]
     fn interrupted_work_waits_for_lease_then_replays_and_rejects_old_ack() {
         let (root, store) = store();

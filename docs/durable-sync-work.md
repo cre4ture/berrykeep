@@ -15,6 +15,11 @@ Claims and resource leases are transactional. Superseding an in-flight generatio
 does not release its resource until that execution finishes or its lease expires.
 Generation and claim tokens reject stale acknowledgements. Long operations renew
 their leases; opening another connection does not steal live work.
+Each production profile has one executor process, protected by an OS file lock
+retained by all of its journal clones. After that process exits, the next owner
+atomically reclaims orphaned work immediately rather than waiting for the old
+lease deadline. Control connections can inspect and authorize work while an
+executor is active; they do not execute filesystem or network effects.
 
 Namespace identity, content availability, and local modifications are separate
 concepts. A placeholder can satisfy metadata availability while an eager folder
@@ -80,6 +85,9 @@ journals upload intent and accepted receipts before returning success. Receipt
 repair is separate durable work and advances only the upload's own source
 identity, preserving local bytes that changed during transfer. Newly accepted
 object identity is retained even when the file disappears before the first scan.
+Directory-marker deletion is nonrecursive and succeeds only when the server's
+live namespace has no descendants. A new or unseen child causes a mutation
+conflict (HTTP409); children are never swept away by an automatic recursive retry.
 Provider threads serialize each path through the entire close-upload finalizer,
 including its receipt, snapshot and USN checks. Receipt repair waits for that
 boundary and re-inspects identity before writing; it cannot invalidate a USN

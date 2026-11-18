@@ -491,7 +491,7 @@ impl SyncRootMonitor {
             sync_root,
             identity.provider_instance_id,
             uploader.clone(),
-            sync_agent_core::sync_work::WorkStore::open(path)?,
+            sync_agent_core::sync_work::WorkStore::open_for_executor(path)?,
         )?;
         monitor.uploader = Arc::new(work::JournaledUploader {
             inner: uploader,
