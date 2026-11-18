@@ -23,6 +23,45 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
+    fn long_windows_journal_paths_support_owner_reopen_and_wal() {
+        let (root, short_store) = store();
+        drop(short_store);
+        let mut parent = root;
+        while parent.as_os_str().len() < 310 {
+            parent = parent.join("long-journal-directory-with-unicode-ü-and-nested-profile-state");
+        }
+        let path = parent.join("sync-work.sqlite");
+        assert!(path.as_os_str().len() > 260);
+        let owner = WorkStore::open_for_executor(&path).unwrap();
+        owner.enqueue("intent", &[op("a", 1)]).unwrap();
+        let control = WorkStore::open(&path).unwrap();
+        assert_eq!(control.status("intent").unwrap().pending, 1);
+        assert_eq!(control.path(), path);
+        let old = owner
+            .claim_next("intent", now_ms(), 120_000)
+            .unwrap()
+            .unwrap();
+        drop(owner);
+        let recovered = WorkStore::open_for_executor(&path).unwrap();
+        let replay = recovered
+            .claim_next("intent", now_ms(), 120_000)
+            .unwrap()
+            .unwrap();
+        assert!(
+            !recovered
+                .finish(&old, WorkResult::Complete, now_ms())
+                .unwrap()
+        );
+        assert!(
+            recovered
+                .finish(&replay, WorkResult::Complete, now_ms())
+                .unwrap()
+        );
+        assert_eq!(control.status("intent").unwrap().completed, 1);
+    }
+
+    #[test]
     fn executor_ownership_retains_live_claims_and_recovers_only_after_owner_stops() {
         let (root, control) = store();
         let path = root.join("work.sqlite");

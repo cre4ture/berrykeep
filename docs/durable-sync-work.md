@@ -5,6 +5,9 @@ adapters. Its SQLite journal lives in adapter-owned profile state, outside the
 synced tree. WAL with `synchronous=FULL` persists intent before observations can
 advance. A completed side effect and a SQLite commit are separate events:
 executors must inspect actual identity and revision before replaying work.
+On Windows, SQLite opens the journal through its canonical existing parent and
+an extended-length path, including the WAL companions. Profile names and deep
+state directories do not impose the legacy 260-character limit on the journal.
 
 Desired remote materialization replaces obsolete work. Local mutation intents
 are enqueued separately and are never cancelled merely because a remote snapshot

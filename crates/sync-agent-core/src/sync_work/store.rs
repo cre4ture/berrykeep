@@ -122,7 +122,7 @@ impl WorkStore {
         {
             std::fs::create_dir_all(parent)?;
         }
-        let mut connection = Connection::open(path)
+        let mut connection = Connection::open(database_open_path(path)?)
             .with_context(|| format!("opening sync work journal {}", path.display()))?;
         connection.busy_timeout(Duration::from_secs(10))?;
         connection.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;
@@ -596,6 +596,25 @@ fn postpone_resource(connection: &Connection, resource: &str) -> Result<()> {
         WHERE (scope,key) IN (SELECT scope,key FROM sync_work WHERE resource=?1 AND state IN ('pending','running'))",[resource])?;
     Ok(())
 }
+fn database_open_path(path: &Path) -> Result<PathBuf> {
+    #[cfg(windows)]
+    if path != Path::new(":memory:") {
+        // SQLite's Windows VFS needs an extended-length path even though Rust's
+        // filesystem API can already create the directory and owner sidecar.
+        // The database need not exist yet, so canonicalize only its parent.
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty());
+        let parent = std::fs::canonicalize(parent.unwrap_or_else(|| Path::new(".")))
+            .with_context(|| format!("resolving sync journal directory for {}", path.display()))?;
+        let file_name = path
+            .file_name()
+            .context("sync journal requires a file name")?;
+        return Ok(parent.join(file_name));
+    }
+    Ok(path.to_path_buf())
+}
+
 pub fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
