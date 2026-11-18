@@ -18,8 +18,10 @@ Claims and resource leases are transactional. Superseding an in-flight generatio
 does not release its resource until that execution finishes or its lease expires.
 Generation and claim tokens reject stale acknowledgements. Long operations renew
 their leases; opening another connection does not steal live work.
-Each production profile has one executor process, protected by an OS file lock
-retained by all of its journal clones. After that process exits, the next owner
+Each production profile has one executor process, protected by an exclusive
+SQLite ownership-sidecar transaction retained by all of its journal clones.
+Its OS lock works on Android as well as desktop platforms and leaves the main
+journal available to control connections. After that process exits, the next owner
 atomically reclaims orphaned work immediately rather than waiting for the old
 lease deadline. Control connections can inspect and authorize work while an
 executor is active; they do not execute filesystem or network effects.

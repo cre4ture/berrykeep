@@ -138,8 +138,56 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+        if std::env::var_os("BERRYKEEP_TEST_WORK_EXECUTOR_HOLD").is_some() {
+            println!("executor-owner-ready");
+            std::io::Write::flush(&mut std::io::stdout()).unwrap();
+            let mut release = [0];
+            std::io::Read::read_exact(&mut std::io::stdin(), &mut release).unwrap();
+        }
         // Exit without running Rust destructors, as when the provider is killed.
         std::process::exit(17);
+    }
+
+    #[test]
+    fn live_executor_in_another_process_excludes_owners_but_not_controls() {
+        use std::io::BufRead;
+        let (root, control) = store();
+        let path = root.join("work.sqlite");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "sync_work::tests::executor_abrupt_exit_fixture",
+                "--nocapture",
+            ])
+            .env("BERRYKEEP_TEST_WORK_EXECUTOR_CRASH", &path)
+            .env("BERRYKEEP_TEST_WORK_EXECUTOR_HOLD", "1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let output = std::io::BufReader::new(child.stdout.take().unwrap());
+        assert!(
+            output
+                .lines()
+                .map(Result::unwrap)
+                .any(|line| line.contains("executor-owner-ready"))
+        );
+        let second_owner = WorkStore::open_for_executor(&path);
+        let status_while_owned = control.status("intent");
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(
+            second_owner.is_err(),
+            "another process must retain exclusive execution"
+        );
+        assert_eq!(status_while_owned.unwrap().running, 1);
+        let recovered = WorkStore::open_for_executor(path).unwrap();
+        assert!(
+            recovered
+                .claim_next("intent", now_ms(), 120_000)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]

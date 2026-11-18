@@ -63,7 +63,7 @@ pub struct WorkConflict {
 pub struct WorkStore {
     connection: Arc<Mutex<Connection>>,
     path: PathBuf,
-    executor_owner: Option<Arc<std::fs::File>>,
+    executor_owner: Option<Arc<Mutex<Connection>>>,
 }
 
 // Only eligible work is indexed here. Completed jobs and blocked descendants are
@@ -91,19 +91,24 @@ impl WorkStore {
         {
             std::fs::create_dir_all(parent)?;
         }
-        let owner_path = path.with_extension("executor.lock");
-        let owner = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&owner_path)
+        // A dedicated SQLite transaction uses the same portable OS locking as
+        // the work journal, including Android where std File::try_lock is not
+        // implemented. It never locks the main journal used by control clients.
+        let owner_path = path.with_extension("executor.sqlite");
+        let owner = Connection::open(database_open_path(&owner_path)?)
             .with_context(|| format!("opening sync executor ownership {}", owner_path.display()))?;
-        owner
-            .try_lock()
-            .with_context(|| format!("another sync executor owns {}", path.display()))?;
+        owner.busy_timeout(Duration::ZERO)?;
+        if let Err(error) = owner.execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;") {
+            if matches!(&error, rusqlite::Error::SqliteFailure(code, _) if matches!(code.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked))
+            {
+                bail!("another sync executor owns {}", path.display());
+            }
+            return Err(error).with_context(|| {
+                format!("locking sync executor ownership {}", owner_path.display())
+            });
+        }
         let mut store = Self::open(path)?;
-        store.executor_owner = Some(Arc::new(owner));
+        store.executor_owner = Some(Arc::new(Mutex::new(owner)));
         {
             let mut connection = store.lock()?;
             let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
