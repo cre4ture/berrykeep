@@ -1,4 +1,92 @@
 use super::*;
+
+#[test]
+fn terminal_upload_conflict_retains_typed_reason_without_rearming_on_local_edits() {
+    struct ConflictingUploader(std::sync::atomic::AtomicUsize);
+    impl Uploader for ConflictingUploader {
+        fn upload_reader_for_object(
+            &self,
+            path: &str,
+            _: Option<&str>,
+            _: Option<&str>,
+            reader: &mut dyn std::io::Read,
+            length: u64,
+        ) -> Result<crate::runtime::UploadReceipt> {
+            self.upload_reader(path, reader, length)
+        }
+        fn upload_reader(
+            &self,
+            _: &str,
+            _: &mut dyn std::io::Read,
+            _: u64,
+        ) -> Result<crate::runtime::UploadReceipt> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(client_sdk::ObjectMutationConflict::new("upload", "expected r1, remote r2").into())
+        }
+    }
+    let work = CfapiWork::new(
+        root(),
+        uuid::Uuid::nil(),
+        WorkStore::open(":memory:").unwrap(),
+        RemoteAppliedTracker::default(),
+    )
+    .unwrap();
+    let inner = Arc::new(ConflictingUploader(std::sync::atomic::AtomicUsize::new(0)));
+    let uploader = JournaledUploader {
+        work: work.clone(),
+        inner: inner.clone(),
+    };
+    for length in [1, 2] {
+        let error = uploader
+            .upload_reader_for_object(
+                "a.txt",
+                Some("object"),
+                Some("r1"),
+                &mut std::io::Cursor::new(vec![0; length as usize]),
+                length,
+            )
+            .unwrap_err();
+        assert!(
+            is_remote_mutation_conflict(&error),
+            "terminal conflict must remain typed: {error:#}"
+        );
+        assert!(format!("{error:#}").contains("remote r2"));
+    }
+    assert_eq!(
+        inner.0.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "editing local bytes does not authorize another stale CAS attempt"
+    );
+    let entries = CfapiWork::conflicts_in(&work.store).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].path, "a.txt");
+    assert_eq!(entries[0].operation, "upload");
+    assert!(entries[0].reason.contains("remote r2"));
+}
+
+#[test]
+fn materialization_conflict_list_names_actual_failed_paths_in_a_partial_batch() {
+    let store = WorkStore::open(":memory:").unwrap();
+    let job = PlannedWork::new(
+        "batch",
+        "group",
+        serde_json::to_value(Materialization {
+            actions: vec![file("good.txt"), file("bad.txt")],
+            availability: ContentAvailability::MetadataOnly,
+        })
+        .unwrap(),
+    );
+    store.enqueue(MATERIALIZATION_SCOPE, &[job]).unwrap();
+    let lease = store
+        .claim_next(MATERIALIZATION_SCOPE, now_ms(), 120_000)
+        .unwrap()
+        .unwrap();
+    store.finish(&lease, WorkResult::Conflict(serde_json::json!([{"path":"bad.txt","operation":"materialize","reason":"local bytes changed"}]).to_string()), now_ms()).unwrap();
+    let entries = CfapiWork::conflicts_in(&store).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].path, "bad.txt");
+    assert_eq!(entries[0].reason, "local bytes changed");
+}
 #[derive(Default)]
 struct RecordingUploader {
     deletes: Mutex<Vec<(String, String)>>,

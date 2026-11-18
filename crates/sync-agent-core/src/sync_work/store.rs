@@ -54,6 +54,11 @@ pub struct WorkStatus {
     pub conflicts: u64,
     pub completed: u64,
 }
+#[derive(Clone, Debug)]
+pub struct WorkConflict {
+    pub work: PlannedWork,
+    pub reason: String,
+}
 #[derive(Clone)]
 pub struct WorkStore {
     connection: Arc<Mutex<Connection>>,
@@ -458,6 +463,38 @@ impl WorkStore {
     }
     pub fn conflicts(&self, scope: &str) -> Result<Vec<PlannedWork>> {
         self.read_work(scope, "conflict")
+    }
+    pub fn conflict_details(&self, scope: &str) -> Result<Vec<WorkConflict>> {
+        self.read_conflict_details(scope, None)
+    }
+    pub fn conflict_detail(&self, scope: &str, key: &str) -> Result<Option<WorkConflict>> {
+        Ok(self
+            .read_conflict_details(scope, Some(key))?
+            .into_iter()
+            .next())
+    }
+    fn read_conflict_details(&self, scope: &str, key: Option<&str>) -> Result<Vec<WorkConflict>> {
+        let connection = self.lock()?;
+        let sql = if key.is_some() {
+            "SELECT key,resource,payload,dependencies,coalesce(error,'Sync operation conflict') FROM sync_work WHERE scope=?1 AND key=?2 AND state='conflict'"
+        } else {
+            "SELECT key,resource,payload,dependencies,coalesce(error,'Sync operation conflict') FROM sync_work WHERE scope=?1 AND state='conflict' AND ?2 IS NULL ORDER BY key"
+        };
+        let mut statement = connection.prepare(sql)?;
+        let mut rows = statement.query(params![scope, key])?;
+        let mut conflicts = Vec::new();
+        while let Some(row) = rows.next()? {
+            conflicts.push(WorkConflict {
+                work: PlannedWork {
+                    key: row.get(0)?,
+                    resource: row.get(1)?,
+                    payload: serde_json::from_str(&row.get::<_, String>(2)?)?,
+                    depends_on: serde_json::from_str(&row.get::<_, String>(3)?)?,
+                },
+                reason: row.get(4)?,
+            });
+        }
+        Ok(conflicts)
     }
     pub fn active_resources(&self, scope: &str) -> Result<Vec<String>> {
         Ok(self.lock()?.prepare("SELECT DISTINCT resource FROM sync_work WHERE scope=?1 AND state IN ('pending','running','conflict')")?.query_map([scope],|row|row.get(0))?.collect::<rusqlite::Result<Vec<_>>>()?)

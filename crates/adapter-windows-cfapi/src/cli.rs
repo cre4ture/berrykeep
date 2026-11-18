@@ -273,6 +273,42 @@ enum Commands {
     Unregister(UnregisterArgs),
     Pin(PinArgs),
     CancelHydration(CancelHydrationArgs),
+    Conflicts(ConflictsArgs),
+}
+
+#[derive(Debug, Parser)]
+struct ConflictsArgs {
+    #[command(subcommand)]
+    command: ConflictCommands,
+}
+
+#[derive(Debug, Subcommand)]
+enum ConflictCommands {
+    /// List unresolved sync operations with their persisted reasons.
+    List {
+        #[arg(long)]
+        root_path: PathBuf,
+    },
+}
+
+fn conflicts_command(args: ConflictsArgs) -> anyhow::Result<()> {
+    match args.command {
+        ConflictCommands::List { root_path } => {
+            let context = crate::sync_root_identity::load_registered_sync_root_context(&root_path)?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("the supplied root is not a registered BerryKeep sync root")
+                })?;
+            let path = crate::monitor::journal_path(&root_path, &context.identity);
+            if !path.exists() {
+                println!("[]");
+                return Ok(());
+            }
+            let store = sync_agent_core::sync_work::WorkStore::open(path)?;
+            let conflicts = crate::monitor::CfapiWork::conflicts_in(&store)?;
+            println!("{}", serde_json::to_string_pretty(&conflicts)?);
+            Ok(())
+        }
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -371,6 +407,7 @@ pub fn cli_main() -> anyhow::Result<()> {
         Commands::Unregister(args) => unregister_sync_root(&PathBuf::from(args.root_path)),
         Commands::Pin(args) => pin_placeholder_locally(args),
         Commands::CancelHydration(args) => cancel_placeholder_hydration(args),
+        Commands::Conflicts(args) => conflicts_command(args),
 
         Commands::Serve(args) => serve_sync_root(args),
     }
@@ -1025,6 +1062,21 @@ fn resolve_cli_relative_path(root_path: &std::path::Path, requested_path: &str) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conflicts_list_is_scoped_to_a_root_without_journal_identifiers() {
+        assert!(
+            Cli::try_parse_from([
+                "berrykeep-os-integration",
+                "conflicts",
+                "list",
+                "--root-path",
+                "C:/sync"
+            ])
+            .is_ok()
+        );
+        assert!(Cli::try_parse_from(["berrykeep-os-integration", "conflicts", "list"]).is_err());
+    }
 
     #[test]
     fn failed_status_file_write_does_not_fail_journal_status_publication() {

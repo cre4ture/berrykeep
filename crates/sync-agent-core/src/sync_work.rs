@@ -62,6 +62,28 @@ mod tests {
     }
 
     #[test]
+    fn conflict_reason_survives_reopen_for_explicit_controls() {
+        let (root, store) = store();
+        store.enqueue("remote", &[op("a", 1)]).unwrap();
+        let lease = store
+            .claim_next("remote", now_ms(), 120_000)
+            .unwrap()
+            .unwrap();
+        store
+            .finish(
+                &lease,
+                WorkResult::Conflict("expected r1, found r2".into()),
+                now_ms(),
+            )
+            .unwrap();
+        let reopened = WorkStore::open(root.join("work.sqlite")).unwrap();
+        let conflicts = reopened.conflict_details("remote").unwrap();
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].work, op("a", 1));
+        assert_eq!(conflicts[0].reason, "expected r1, found r2");
+    }
+
+    #[test]
     fn executor_ownership_retains_live_claims_and_recovers_only_after_owner_stops() {
         let (root, control) = store();
         let path = root.join("work.sqlite");

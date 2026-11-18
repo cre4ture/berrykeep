@@ -1,4 +1,5 @@
 use super::*;
+mod controls;
 mod materialization;
 mod namespace;
 #[cfg(test)]

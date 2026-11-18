@@ -259,6 +259,13 @@ impl Uploader for JournaledUploader {
         reader: &mut dyn std::io::Read,
         length: u64,
     ) -> Result<crate::runtime::UploadReceipt> {
+        if let Some(conflict) = self.work.store.conflict_detail(UPLOAD_SCOPE, path)? {
+            return Err(client_sdk::ObjectMutationConflict::new(
+                "upload",
+                format!("{path}: {}", conflict.reason),
+            )
+            .into());
+        }
         let observed = self
             .work
             .baseline

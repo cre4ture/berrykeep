@@ -125,6 +125,12 @@ directory attribute hints are verified with metadata-only placeholder inspection
 a cold placeholder is never treated as an ordinary upload merely because cached
 enumeration attributes omit its placeholder flag. Existing status surfaces show
 pending work and conflicts instead of announcing completion after scheduling.
+`berrykeep-os-integration conflicts list --root-path C:/path/to/root` reads
+persisted operation reasons using the registered cluster/profile identity.
+It does not acquire executor ownership or execute sync effects. Materialization
+batches identify the actual conflicting paths; healthy siblings stay out of the
+list. Terminal upload conflicts retain their typed reason and require explicit
+resolution; changing the local file's length does not authorize a stale CAS retry.
 This adds a metadata probe per visited entry intentionally: file size, timestamps
 and previous classification cannot prove that a zero-length file has not become
 a placeholder. Probe failures defer that entry with an observable diagnostic;

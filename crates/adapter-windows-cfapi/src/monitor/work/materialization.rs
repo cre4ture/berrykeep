@@ -81,7 +81,7 @@ impl CfapiWork {
             .map(|gate| gate.lock().unwrap_or_else(|e| e.into_inner()))
             .collect::<Vec<_>>();
         let protected = self.protected_paths()?;
-        let mut conflict = None;
+        let mut conflicts = Vec::new();
         let mut waiting = None;
         let actions = work
             .actions
@@ -121,7 +121,10 @@ impl CfapiWork {
                     if !entry.is_placeholder
                         || entry.placeholder_object_id.as_deref() != action_object_id(action)
                     {
-                        conflict = Some(format!("local object identity differs at {path}"));
+                        conflicts.push(controls::ConflictDescription::materialization(
+                            path,
+                            format!("local object identity differs at {path}"),
+                        ));
                         return None;
                     }
                     if entry
@@ -131,7 +134,10 @@ impl CfapiWork {
                         // Metadata already represents this revision; modified local bytes
                         // remain for the independent guarded upload path.
                         if entry.placeholder_revision.as_deref() != action_revision(action) {
-                            conflict = Some(format!("locally modified placeholder at {path}"));
+                            conflicts.push(controls::ConflictDescription::materialization(
+                                path,
+                                format!("locally modified placeholder at {path}"),
+                            ));
                         }
                         return None;
                     }
@@ -214,10 +220,12 @@ impl CfapiWork {
             .lock()
             .unwrap_or_else(|err| err.into_inner())
             .extend(observed);
-        Ok(match (retry, conflict) {
-            (Some(error), _) => WorkResult::Retry(error),
-            (None, Some(error)) => WorkResult::Conflict(error),
-            _ => WorkResult::Complete,
+        Ok(if let Some(error) = retry {
+            WorkResult::Retry(error)
+        } else if !conflicts.is_empty() {
+            WorkResult::Conflict(serde_json::to_string(&conflicts)?)
+        } else {
+            WorkResult::Complete
         })
     }
 }
