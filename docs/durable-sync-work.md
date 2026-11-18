@@ -18,6 +18,11 @@ Claims and resource leases are transactional. Superseding an in-flight generatio
 does not release its resource until that execution finishes or its lease expires.
 Generation and claim tokens reject stale acknowledgements. Long operations renew
 their leases; opening another connection does not steal live work.
+Acknowledgements and durable progress checkpoints also verify actual resource
+ownership, including when another key acquired an expired resource. Execution
+progress is separate from the desired operation payload: retries and orphan
+recovery retain it, unchanged planning cannot reset it, and superseding work
+starts with fresh progress.
 Each production profile has one executor process, protected by an exclusive
 SQLite ownership-sidecar transaction retained by all of its journal clones.
 Its OS lock works on Android as well as desktop platforms and leaves the main

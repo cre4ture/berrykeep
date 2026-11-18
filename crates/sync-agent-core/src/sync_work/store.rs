@@ -37,6 +37,7 @@ pub enum ContentAvailability {
 pub struct WorkLease {
     pub scope: String,
     pub work: PlannedWork,
+    pub progress: Option<Value>,
     generation: i64,
     token: i64,
     attempts: u32,
@@ -68,7 +69,7 @@ pub struct WorkStore {
 
 // Only eligible work is indexed here. Completed jobs and blocked descendants are
 // absent, so claiming a large tree does not repeatedly scan its completed prefix.
-const CLAIM_SQL:&str="SELECT w.key,w.resource,w.payload,w.dependencies,w.generation,w.token,w.attempts
+const CLAIM_SQL:&str="SELECT w.key,w.resource,w.payload,w.dependencies,w.generation,w.token,w.attempts,w.progress
     FROM sync_work_ready r INDEXED BY sync_work_due
     JOIN sync_work w ON w.scope=r.scope AND w.key=r.key
     WHERE r.scope=?1 AND r.available_at<=?2 AND (?3 IS NULL OR r.key=?3)
@@ -140,7 +141,7 @@ impl WorkStore {
                 scope TEXT NOT NULL,key TEXT NOT NULL,resource TEXT NOT NULL,payload TEXT NOT NULL,dependencies TEXT NOT NULL,
                 generation INTEGER NOT NULL DEFAULT 1,token INTEGER NOT NULL DEFAULT 0,state TEXT NOT NULL DEFAULT 'pending',
                 attempts INTEGER NOT NULL DEFAULT 0,available_at INTEGER NOT NULL DEFAULT 0,lease_until INTEGER NOT NULL DEFAULT 0,
-                error TEXT,finished_at INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(scope,key));
+                error TEXT,progress TEXT,finished_at INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(scope,key));
             CREATE INDEX IF NOT EXISTS sync_work_status ON sync_work(scope,state);
             CREATE INDEX IF NOT EXISTS sync_work_resource ON sync_work(resource,scope,key);
             CREATE TABLE IF NOT EXISTS sync_work_resources(resource TEXT PRIMARY KEY,scope TEXT NOT NULL,key TEXT NOT NULL,
@@ -181,6 +182,20 @@ impl WorkStore {
                 PRAGMA user_version=2;")?;
             tx.commit()?;
         }
+        if version < 3 {
+            let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let has_progress = tx
+                .prepare("PRAGMA table_info(sync_work)")?
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+                .iter()
+                .any(|name| name == "progress");
+            if !has_progress {
+                tx.execute("ALTER TABLE sync_work ADD COLUMN progress TEXT", [])?;
+            }
+            tx.execute_batch("PRAGMA user_version=3")?;
+            tx.commit()?;
+        }
         connection.execute("CREATE INDEX IF NOT EXISTS sync_work_terminal ON sync_work(finished_at) WHERE state IN ('complete','cancelled')",[])?;
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
@@ -215,7 +230,7 @@ impl WorkStore {
             }
             let changed=tx.execute("INSERT INTO sync_work(scope,key,resource,payload,dependencies) VALUES(?1,?2,?3,?4,?5)
                 ON CONFLICT(scope,key) DO UPDATE SET resource=excluded.resource,payload=excluded.payload,dependencies=excluded.dependencies,
-                generation=sync_work.generation+1,token=sync_work.token+1,state='pending',attempts=0,available_at=0,lease_until=0,error=NULL,finished_at=0
+                generation=sync_work.generation+1,token=sync_work.token+1,state='pending',attempts=0,available_at=0,lease_until=0,error=NULL,progress=NULL,finished_at=0
                 WHERE sync_work.payload<>excluded.payload OR sync_work.dependencies<>excluded.dependencies OR sync_work.resource<>excluded.resource OR sync_work.state='cancelled'",
                 params![scope,item.key,item.resource,serde_json::to_string(&item.payload)?,serde_json::to_string(&item.depends_on)?])?;
             if changed != 0 {
@@ -277,10 +292,12 @@ impl WorkStore {
                     row.get::<_, i64>(4)?,
                     row.get::<_, i64>(5)?,
                     row.get::<_, u32>(6)?,
+                    row.get::<_, Option<String>>(7)?,
                 ))
             })
             .optional()?;
-        let Some((key, resource, payload, dependencies, generation, token, attempts)) = candidate
+        let Some((key, resource, payload, dependencies, generation, token, attempts, progress)) =
+            candidate
         else {
             return Ok(None);
         };
@@ -302,7 +319,16 @@ impl WorkStore {
             generation,
             token,
             attempts: attempts + 1,
+            progress: progress
+                .map(|value| serde_json::from_str(&value))
+                .transpose()?,
         }))
+    }
+    /// Save execution progress without changing the immutable desired payload.
+    /// Both the work token and actual resource owner must still match.
+    pub fn checkpoint<T: Serialize>(&self, lease: &WorkLease, progress: &T) -> Result<bool> {
+        Ok(self.lock()?.execute("UPDATE sync_work SET progress=?5 WHERE scope=?1 AND key=?2 AND generation=?3 AND token=?4 AND state='running'
+            AND EXISTS(SELECT 1 FROM sync_work_resources a WHERE a.resource=sync_work.resource AND a.scope=?1 AND a.key=?2 AND a.generation=?3 AND a.token=?4)", params![lease.scope,lease.work.key,lease.generation,lease.token,serde_json::to_string(progress)?])? == 1)
     }
     pub fn renew(&self, lease: &WorkLease, now: i64, lease_ms: i64) -> Result<bool> {
         let mut connection = self.lock()?;
@@ -327,7 +353,8 @@ impl WorkStore {
         };
         let mut connection = self.lock()?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let applied=tx.execute("UPDATE sync_work SET state=?5,error=?6,available_at=?7,lease_until=0,finished_at=?8 WHERE scope=?1 AND key=?2 AND generation=?3 AND token=?4 AND state='running'",params![lease.scope,lease.work.key,lease.generation,lease.token,state,error,now.saturating_add(delay),if state=="complete" {now}else{0}])?==1;
+        let applied=tx.execute("UPDATE sync_work SET state=?5,error=?6,available_at=?7,lease_until=0,finished_at=?8 WHERE scope=?1 AND key=?2 AND generation=?3 AND token=?4 AND state='running'
+            AND EXISTS(SELECT 1 FROM sync_work_resources a WHERE a.resource=sync_work.resource AND a.scope=?1 AND a.key=?2 AND a.generation=?3 AND a.token=?4)",params![lease.scope,lease.work.key,lease.generation,lease.token,state,error,now.saturating_add(delay),if state=="complete" {now}else{0}])?==1;
         tx.execute("DELETE FROM sync_work_resources WHERE resource=?1 AND scope=?2 AND key=?3 AND generation=?4 AND token=?5",params![lease.work.resource,lease.scope,lease.work.key,lease.generation,lease.token])?;
         refresh_ready(&tx, &lease.scope, &lease.work.key)?;
         postpone_resource(&tx, &lease.work.resource)?;
@@ -378,7 +405,7 @@ impl WorkStore {
     fn change_state(&self, scope: &str, key: &str, from: &str, to: &str) -> Result<()> {
         let mut connection = self.lock()?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute("UPDATE sync_work SET state=?4,generation=generation+1,token=token+1,attempts=0,available_at=0,finished_at=0 WHERE scope=?1 AND key=?2 AND state=?3",params![scope,key,from,to])?;
+        tx.execute("UPDATE sync_work SET state=?4,generation=generation+1,token=token+1,attempts=0,available_at=0,finished_at=0,progress=NULL WHERE scope=?1 AND key=?2 AND state=?3",params![scope,key,from,to])?;
         refresh_ready(&tx, scope, key)?;
         refresh_dependents(&tx, scope, key)?;
         tx.commit()?;
@@ -405,7 +432,7 @@ impl WorkStore {
     ) -> Result<bool> {
         let mut connection = self.lock()?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let applied=tx.execute("UPDATE sync_work SET payload=?4,state='pending',generation=generation+1,token=token+1,attempts=0,available_at=0,error=NULL WHERE scope=?1 AND key=?2 AND state='conflict' AND payload=?3",params![scope,work.key,serde_json::to_string(&work.payload)?,serde_json::to_string(payload)?])?==1;
+        let applied=tx.execute("UPDATE sync_work SET payload=?4,state='pending',generation=generation+1,token=token+1,attempts=0,available_at=0,error=NULL,progress=NULL WHERE scope=?1 AND key=?2 AND state='conflict' AND payload=?3",params![scope,work.key,serde_json::to_string(&work.payload)?,serde_json::to_string(payload)?])?==1;
         if applied {
             refresh_ready(&tx, scope, &work.key)?;
         }

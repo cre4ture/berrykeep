@@ -62,6 +62,83 @@ mod tests {
     }
 
     #[test]
+    fn progress_schema_upgrade_keeps_live_ownership_and_desired_work() {
+        let (root, store) = store();
+        store.enqueue("control", &[op("a", 1)]).unwrap();
+        let active = store.claim_next("control", 100, 50).unwrap().unwrap();
+        rusqlite::Connection::open(root.join("work.sqlite"))
+            .unwrap()
+            .execute_batch("ALTER TABLE sync_work DROP COLUMN progress; PRAGMA user_version=2;")
+            .unwrap();
+        let upgraded = WorkStore::open(root.join("work.sqlite")).unwrap();
+        assert_eq!(upgraded.work("control").unwrap(), vec![op("a", 1)]);
+        assert!(upgraded.claim_next("control", 149, 50).unwrap().is_none());
+        assert!(
+            store
+                .checkpoint(&active, &json!({"frozen_revision":"r2"}))
+                .unwrap()
+        );
+        let replay = upgraded.claim_next("control", 150, 50).unwrap().unwrap();
+        assert_eq!(replay.progress, Some(json!({"frozen_revision":"r2"})));
+    }
+
+    #[test]
+    fn expired_claim_cannot_acknowledge_after_another_key_owns_its_resource() {
+        let (_, store) = store();
+        let mut a = op("a", 1);
+        a.resource = "shared".into();
+        let mut b = op("b", 1);
+        b.resource = "shared".into();
+        store.enqueue("scope", &[a, b]).unwrap();
+        let old = store.claim_key("scope", "a", 100, 50).unwrap().unwrap();
+        let current = store.claim_key("scope", "b", 150, 50).unwrap().unwrap();
+        assert!(!store.checkpoint(&old, &json!({"stale":true})).unwrap());
+        assert!(
+            !store.finish(&old, WorkResult::Complete, 160).unwrap(),
+            "a work row token alone cannot acknowledge another key's resource"
+        );
+        assert!(
+            store.renew(&current, 160, 50).unwrap(),
+            "late old completion must retain the current owner's claim"
+        );
+        assert!(store.finish(&current, WorkResult::Complete, 161).unwrap());
+    }
+
+    #[test]
+    fn durable_progress_survives_reconcile_and_replay_but_not_supersession() {
+        let (root, store) = store();
+        let intent = op("a", 1);
+        store
+            .reconcile("control", std::slice::from_ref(&intent))
+            .unwrap();
+        let first = store.claim_next("control", 100, 50).unwrap().unwrap();
+        assert!(
+            store
+                .checkpoint(&first, &json!({"frozen_revision":"r2"}))
+                .unwrap()
+        );
+        store.reconcile("control", &[intent]).unwrap();
+        let reopened = WorkStore::open(root.join("work.sqlite")).unwrap();
+        assert!(reopened.claim_next("control", 149, 50).unwrap().is_none());
+        let replay = reopened.claim_next("control", 150, 50).unwrap().unwrap();
+        assert_eq!(replay.progress, Some(json!({"frozen_revision":"r2"})));
+        assert!(
+            !store
+                .checkpoint(&first, &json!({"frozen_revision":"stale"}))
+                .unwrap()
+        );
+        store.reconcile("control", &[op("a", 2)]).unwrap();
+        assert!(
+            !store
+                .checkpoint(&replay, &json!({"frozen_revision":"superseded"}))
+                .unwrap()
+        );
+        assert!(!store.finish(&replay, WorkResult::Complete, 151).unwrap());
+        let next = store.claim_next("control", 152, 50).unwrap().unwrap();
+        assert!(next.progress.is_none());
+    }
+
+    #[test]
     fn conflict_reason_survives_reopen_for_explicit_controls() {
         let (root, store) = store();
         store.enqueue("remote", &[op("a", 1)]).unwrap();
@@ -132,11 +209,14 @@ mod tests {
         };
         let store = WorkStore::open_for_executor(path).unwrap();
         store.enqueue("intent", &[op("crash", 7)]).unwrap();
+        let lease = store
+            .claim_next("intent", now_ms(), 120_000)
+            .unwrap()
+            .unwrap();
         assert!(
             store
-                .claim_next("intent", now_ms(), 120_000)
+                .checkpoint(&lease, &json!({"frozen_revision":"r2"}))
                 .unwrap()
-                .is_some()
         );
         if std::env::var_os("BERRYKEEP_TEST_WORK_EXECUTOR_HOLD").is_some() {
             println!("executor-owner-ready");
@@ -206,6 +286,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(lease.work.payload, json!({"revision":7}));
+        assert_eq!(lease.progress, Some(json!({"frozen_revision":"r2"})));
     }
 
     #[test]
