@@ -105,6 +105,9 @@ Missing previously observed paths wait for a topology scan so
 background population cannot recreate an unobserved user deletion or rename.
 Partial batch success is recorded per path before acknowledgement; a failed
 first entry does not prevent independent siblings from being attempted.
+An intent arriving after scheduling temporarily blocks matching paths and object
+IDs. The batch remains pending and resumes from its persisted plan when that
+protection clears, without requiring another remote snapshot.
 Implicit parent directories are derived from eligible children. A protected
 child deletion cannot recreate its empty implicit branch; explicit directory
 marker objects remain independently materializable.

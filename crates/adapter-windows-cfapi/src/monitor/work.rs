@@ -19,6 +19,7 @@ const BASELINE_SCOPE: &str = "cfapi-namespace";
 const FENCE_SCOPE: &str = "cfapi-completed-mutations";
 const UPLOAD_SCOPE: &str = "cfapi-upload";
 const RECEIPT_SCOPE: &str = "cfapi-upload-receipt";
+const LOCAL_NAMESPACE_WAIT_PREFIX: &str = "awaiting local namespace operation";
 
 #[derive(Clone, Serialize, Deserialize)]
 struct ReceiptWork {

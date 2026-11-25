@@ -77,17 +77,34 @@ impl CfapiWork {
             .iter()
             .map(|gate| gate.lock().unwrap_or_else(|e| e.into_inner()))
             .collect::<Vec<_>>();
-        let protected = self.protected_paths()?;
+        let local_intents = self.local_intents()?;
+        let protected = local_intents
+            .iter()
+            .flat_map(|intent| intent.paths().into_iter().map(ToOwned::to_owned))
+            .collect::<BTreeSet<_>>();
+        let protected_ids = local_intents
+            .iter()
+            .map(LocalMutation::object_id)
+            .collect::<BTreeSet<_>>();
         let mut conflicts = Vec::new();
         let mut waiting = None;
         let actions = work
             .actions
             .iter()
-            .filter(|action| {
-                !is_protected(action_path(action), &protected) && !self.suppressed_by_fence(action)
-            })
             .filter_map(|action| {
+                if self.suppressed_by_fence(action) {
+                    return None;
+                }
                 let path = action_path(action);
+                if is_protected(path, &protected)
+                    || action_object_id(action).is_some_and(|id| protected_ids.contains(id))
+                {
+                    // Protection is temporary: acknowledging this batch would
+                    // lose desired work when the intent later resolves without
+                    // another remote snapshot. Independent siblings still run.
+                    waiting = Some(format!("{LOCAL_NAMESPACE_WAIT_PREFIX} for {path}"));
+                    return None;
+                }
                 let full = self.root.join(path.replace('/', "\\"));
                 if !full.exists()
                     && self

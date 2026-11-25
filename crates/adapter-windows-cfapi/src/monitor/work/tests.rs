@@ -1,6 +1,77 @@
 use super::*;
 
 #[test]
+fn queued_materialization_waits_for_later_local_intent_then_resumes_without_snapshot() {
+    for changed_local_path in [false, true] {
+        let (sync_root, provider) =
+            super::super::tests::registered_monitor_test_sync_root("deferred-protected-work");
+        let work = CfapiWork::new(
+            sync_root.root_path.clone(),
+            provider,
+            WorkStore::open(":memory:").unwrap(),
+            RemoteAppliedTracker::default(),
+        )
+        .unwrap();
+        work.schedule(
+            &CfapiActionPlan {
+                actions: vec![file("a.txt"), file("other.txt")],
+            },
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let planned = work.store.all_work(MATERIALIZATION_SCOPE).unwrap()[0]
+            .payload
+            .clone();
+        work.enqueue_intent(&LocalMutation::Delete {
+            path: if changed_local_path {
+                "locally-renamed.txt"
+            } else {
+                "a.txt"
+            }
+            .into(),
+            renamed_from: None,
+            object_id: "object-a.txt".into(),
+            revision: "r1".into(),
+            is_dir: false,
+        })
+        .unwrap();
+        work.drain_materialization().unwrap();
+        assert_eq!(
+            work.store.status(MATERIALIZATION_SCOPE).unwrap().pending,
+            1,
+            "a temporary local protection cannot acknowledge unexecuted desired work"
+        );
+        assert!(!sync_root.root_path.join("a.txt").exists());
+        assert!(
+            sync_root.root_path.join("other.txt").exists(),
+            "protected sibling must not starve independent files"
+        );
+        work.store.cancel(LOCAL_SCOPE, "object-a.txt").unwrap();
+        // Bring the backed-off batch forward without supplying another remote
+        // plan; this is the same persisted desired operation after resolution.
+        let retry = work
+            .store
+            .claim_next(MATERIALIZATION_SCOPE, now_ms() + 10_000, 120_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retry.work.payload, planned);
+        work.store
+            .finish(&retry, WorkResult::Retry("ready".into()), 0)
+            .unwrap();
+        work.drain_materialization().unwrap();
+        assert_eq!(work.store.status(MATERIALIZATION_SCOPE).unwrap().pending, 0);
+        let entry = snapshot_entry(
+            &sync_root.root_path,
+            "a.txt",
+            &sync_root.root_path.join("a.txt"),
+            false,
+        );
+        assert_eq!(entry.placeholder_object_id.as_deref(), Some("object-a.txt"));
+        assert_eq!(entry.placeholder_state.unwrap().on_disk_data_size, 0);
+    }
+}
+
+#[test]
 fn terminal_upload_conflict_retains_typed_reason_without_rearming_on_local_edits() {
     struct ConflictingUploader(std::sync::atomic::AtomicUsize);
     impl Uploader for ConflictingUploader {
