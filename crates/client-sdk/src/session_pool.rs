@@ -1640,7 +1640,7 @@ async fn ensure_direct_quic_endpoint(
         "iroh_endpoint_created"
     );
     let relay_ticket_refresh = match (rendezvous, relay_ticket_collection, initial_relay_tickets) {
-        (Some(_), Some(collection), Some(tickets)) => {
+        (Some(_), collection, Some(tickets)) => {
             let lifecycle = DirectQuicEndpointLifecycle {
                 endpoint_slot: endpoint.clone(),
                 relay_ticket_lease: relay_ticket_lease
@@ -1657,7 +1657,7 @@ async fn ensure_direct_quic_endpoint(
                 bound_endpoint.clone(),
                 lifecycle,
                 tickets,
-                Some(collection),
+                collection,
             ))
         }
         _ => None,
@@ -2006,6 +2006,96 @@ mod tests {
     use super::*;
     use axum::{Json, Router, routing::delete};
     use transport_sdk::{IrohRelayTicket, candidates::ConnectionCandidateTransportHints};
+
+    #[tokio::test]
+    async fn setup_retry_with_an_existing_ticket_keeps_refresh_running() {
+        use axum::{http::StatusCode, response::IntoResponse, routing::post};
+        let attempts = Arc::new(AtomicU64::new(0));
+        let counter = attempts.clone();
+        let router = Router::new()
+            .route(
+                "/control/iroh-relay/ticket",
+                post(move || {
+                    let counter = counter.clone();
+                    async move {
+                        if counter.fetch_add(1, Ordering::SeqCst) > 0 {
+                            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                        }
+                        Json(IrohRelayTicket {
+                            public_urls: vec!["https://relay.invalid".to_string()],
+                            auth_token: "test-only-ticket".to_string(),
+                            expires_at_unix: unix_ts() + 3600,
+                            quic_port: None,
+                        })
+                        .into_response()
+                    }
+                }),
+            )
+            .route(
+                "/control/iroh-relay/ticket/release",
+                delete(|| async { Json(serde_json::json!({ "released": true })) }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let rendezvous = RendezvousControlClient::new(
+            transport_sdk::RendezvousClientConfig {
+                cluster_id: common::ClusterId::now_v7(),
+                rendezvous_urls: vec![url],
+                heartbeat_interval_secs: 15,
+            },
+            None,
+            None,
+        )
+        .unwrap();
+        let budget = IrohRelayLeaseBudget::default();
+        let secret_key = SecretKey::generate();
+        let lease = budget
+            .lease_for_endpoint(rendezvous.clone(), &secret_key.public().to_string())
+            .unwrap();
+        lease.request_tickets().await.unwrap();
+        let candidate = ConnectionCandidate {
+            kind: transport_sdk::CandidateKind::DirectQuic,
+            endpoint: format!("iroh://{}", SecretKey::generate().public()),
+            rtt_ms: None,
+            transport_hints: None,
+        };
+        let endpoint = Arc::new(Mutex::new(None));
+        let identity = Arc::new(Mutex::new(Some(DirectQuicSetupIdentity {
+            secret_key,
+            relay_ticket_lease: Some(lease.clone()),
+        })));
+        let cached = Arc::new(Mutex::new(None));
+        let stats = Arc::new(TransportSessionPoolStats::default());
+        let retired = Arc::new(AtomicBool::new(false));
+        let context = DirectQuicConnectContext {
+            candidate: &candidate,
+            target_node_id: NodeId::new_v4(),
+            endpoint: &endpoint,
+            setup_identity: &identity,
+            lease_budget: budget,
+            retired: &retired,
+            cached_session: &cached,
+            stats: &stats,
+            rendezvous: Some(&rendezvous),
+            relay_ca_pem: None,
+            setup_attempt_id: 2,
+            setup_started: Instant::now(),
+        };
+        ensure_direct_quic_endpoint(&context, None).await.unwrap();
+        let guard = endpoint.lock().await;
+        let managed = guard.as_ref().unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert!(Arc::ptr_eq(
+            managed.relay_ticket_lease.as_ref().unwrap(),
+            &lease
+        ));
+        assert!(
+            managed.relay_ticket_refresh.is_some(),
+            "a reused ticket must retain its refresh and revocation worker"
+        );
+        server.abort();
+    }
 
     #[tokio::test]
     async fn relay_admission_failure_keeps_direct_only_quic_setup_available() {
