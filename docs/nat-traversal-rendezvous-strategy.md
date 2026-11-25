@@ -143,6 +143,10 @@ advertised relay URLs. A reachable origin can issue a ticket while another
 origin has an unconfirmed release; neither origin's network I/O holds a shared
 admission lock.
 
+Once admitted, independent endpoint ticket handshakes share the transport's
+per-origin concurrency gate. Release of an endpoint waits for its own in-flight
+issuance to finish so a late POST cannot recreate a lease after its DELETE.
+
 Unconfirmed issuance and release results continue to occupy their origin's
 budget. Cleanup retries use exponential backoff and free capacity only after an
 acknowledged release or a known ticket expiry plus a conservative clock grace.

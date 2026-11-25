@@ -1,5 +1,5 @@
 use super::{IrohRelayLeaseHandle, lock};
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -27,6 +27,7 @@ struct Entry {
     generation: u64,
     owner: Weak<IrohRelayLeaseHandle>,
     client: RendezvousControlClient,
+    operation: Arc<AsyncMutex<()>>,
     last_access: u64,
     expires_at: Option<Instant>,
     ticket: Option<IrohRelayTicket>,
@@ -51,8 +52,15 @@ impl OriginBudget {
         owner: Arc<IrohRelayLeaseHandle>,
         client: RendezvousControlClient,
     ) -> Result<IrohRelayTicket> {
-        let _admission = self.admission.lock().await;
+        let admission = self.admission.lock().await;
         self.admit(&owner, &client).await?;
+        let operation = lock(&self.state)
+            .entries
+            .get(&owner.endpoint_id)
+            .filter(|entry| entry.generation == owner.generation)
+            .map(|entry| entry.operation.clone())
+            .context("admitted iroh relay lease disappeared before issuance")?;
+        let _operation = operation.lock().await;
         if !owner.authorizes_origin(&self.name) {
             self.retire(&owner.endpoint_id, owner.generation, "retired_before_issue");
             bail!(
@@ -62,11 +70,22 @@ impl OriginBudget {
         }
         // An unsuccessful renewal may nevertheless have created a newer server
         // lease. Do not free that slot using an older ticket's expiry.
-        if let Some(entry) = lock(&self.state).entries.get_mut(&owner.endpoint_id) {
+        if let Some(entry) = lock(&self.state)
+            .entries
+            .get_mut(&owner.endpoint_id)
+            .filter(|entry| entry.generation == owner.generation)
+        {
             entry.expires_at = None;
         }
+        // The reserved slot accounts for this request. Only operations on this
+        // endpoint must wait for its response; other endpoints can issue in parallel.
+        drop(admission);
         let ticket = client.issue_iroh_relay_ticket(&owner.endpoint_id).await?;
-        if let Some(entry) = lock(&self.state).entries.get_mut(&owner.endpoint_id) {
+        if let Some(entry) = lock(&self.state)
+            .entries
+            .get_mut(&owner.endpoint_id)
+            .filter(|entry| entry.generation == owner.generation)
+        {
             // Convert once to a monotonic deadline so later wall-clock changes
             // cannot prematurely free an occupied slot.
             entry.expires_at = Instant::now().checked_add(Duration::from_secs(
@@ -161,6 +180,7 @@ impl OriginBudget {
                 generation: owner.generation,
                 owner: Arc::downgrade(owner),
                 client: client.clone(),
+                operation: Arc::new(AsyncMutex::new(())),
                 last_access,
                 expires_at: None,
                 ticket: None,
@@ -249,6 +269,17 @@ impl OriginBudget {
     }
 
     async fn release_locked(&self, endpoint_id: &str, generation: u64) -> Result<()> {
+        let operation = lock(&self.state)
+            .entries
+            .get(endpoint_id)
+            .filter(|entry| entry.generation == generation)
+            .map(|entry| entry.operation.clone());
+        let Some(operation) = operation else {
+            return Ok(());
+        };
+        // A DELETE must not overtake an in-flight POST and acknowledge a free
+        // slot before that POST creates its server lease.
+        let _operation = operation.lock().await;
         let client = {
             let mut state = lock(&self.state);
             prune_expired(&mut state);

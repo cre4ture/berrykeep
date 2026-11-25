@@ -173,6 +173,59 @@ async fn eventually(mut condition: impl FnMut() -> bool) {
 }
 
 #[tokio::test]
+async fn independent_endpoints_issue_concurrently_at_the_same_origin() {
+    let public = server(8).await;
+    public.state.issue_blocked.store(true, Ordering::SeqCst);
+    let client = rendezvous(&[&public]);
+    let budget = IrohRelayLeaseBudget::default();
+    let mut requests = Vec::new();
+    let mut owners = Vec::new();
+    for _ in 0..3 {
+        let owner = owner(&budget, &client).await;
+        let issuing = owner.clone();
+        requests.push(tokio::spawn(async move { issuing.request_tickets().await }));
+        owners.push(owner);
+    }
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while public.state.issue_count.load(Ordering::SeqCst) < 3 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("free lease slots must allow the transport's three concurrent handshakes");
+    public.state.issue_blocked.store(false, Ordering::SeqCst);
+    public.state.issue_continue.notify_waiters();
+    for request in requests {
+        request.await.unwrap().unwrap();
+    }
+    assert_eq!(public.state.peak.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn eviction_waits_for_in_flight_issuance_before_releasing_its_slot() {
+    let public = server(1).await;
+    let client = rendezvous(&[&public]);
+    let budget = IrohRelayLeaseBudget::with_limit(1);
+    let first = owner(&budget, &client).await;
+    public.state.issue_blocked.store(true, Ordering::SeqCst);
+    let issuing = first.clone();
+    let first_request = tokio::spawn(async move { issuing.request_tickets().await });
+    public.state.issue_started.notified().await;
+    let second = owner(&budget, &client).await;
+    let issuing = second.clone();
+    let second_request = tokio::spawn(async move { issuing.request_tickets().await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(public.state.release_count.load(Ordering::SeqCst), 0);
+    public.state.issue_blocked.store(false, Ordering::SeqCst);
+    public.state.issue_continue.notify_waiters();
+    let _ = first_request.await.unwrap();
+    second_request.await.unwrap().unwrap();
+    assert_eq!(public.state.peak.load(Ordering::SeqCst), 1);
+    assert_eq!(budget.active_per_origin(&public.url), 1);
+    assert!(lock(&public.state.leases).contains_key(second.endpoint_id()));
+}
+
+#[tokio::test]
 async fn healthy_origin_admission_does_not_wait_for_a_hanging_origin_release() {
     let public = server(1).await;
     let lan = server(1).await;
@@ -312,9 +365,17 @@ async fn concurrent_admissions_never_exceed_server_capacity() {
         let owner = owner.clone();
         jobs.spawn(async move { owner.request_tickets().await });
     }
+    let mut completed = 0;
     while let Some(result) = jobs.join_next().await {
-        result.unwrap().unwrap();
+        match result.unwrap() {
+            Ok(_) => completed += 1,
+            Err(error) => assert!(error.to_string().contains("retired"), "{error:#}"),
+        }
     }
+    assert!(
+        completed >= 2,
+        "the last two admitted owners must receive tickets"
+    );
     assert_eq!(budget.active_per_origin(&server.url), 2);
     assert_eq!(server.state.peak.load(Ordering::SeqCst), 2);
 }
