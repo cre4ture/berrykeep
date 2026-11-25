@@ -377,6 +377,7 @@ class ConnectionPathsPresentationTest {
         ewmaThroughputBytesPerSec: Double? = null,
         totalSuccesses: Long = 0L,
         lastSuccessUnixMs: Long? = if (totalSuccesses > 0L) lastUsedUnixMs else null,
+        lastSuccessfulUseUnixMs: Long? = if (lastUsedUnixMs != null) lastSuccessUnixMs else null,
         totalFailures: Long = 0L,
         consecutiveFailures: Int = 0,
         circuitOpenUntilUnixMs: Long? = null,
@@ -397,6 +398,7 @@ class ConnectionPathsPresentationTest {
             totalFailures = totalFailures,
             totalSuccesses = totalSuccesses,
             lastSuccessUnixMs = lastSuccessUnixMs,
+            lastSuccessfulUseUnixMs = lastSuccessfulUseUnixMs,
             circuitOpenUntilUnixMs = circuitOpenUntilUnixMs,
             backgroundProbeInFlight = false,
         )

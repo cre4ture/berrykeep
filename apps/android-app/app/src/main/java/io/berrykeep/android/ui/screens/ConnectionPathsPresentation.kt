@@ -130,7 +130,7 @@ internal fun connectionOverview(
     val activeRoutes = orderedEndpoints.filter { endpoint ->
         endpoint.hasRecentSuccessfulActivity(snapshot.generatedAtUnixMs)
     }
-    val active = activeRoutes.maxByOrNull { endpoint -> endpoint.lastUsedUnixMs ?: Long.MIN_VALUE }
+    val active = activeRoutes.maxByOrNull { endpoint -> endpoint.lastSuccessfulUseUnixMs ?: Long.MIN_VALUE }
     val displayRoute = active ?: orderedEndpoints.firstOrNull()
     val hasSuccess = snapshot.endpoints.any { it.totalSuccesses > 0L }
     val hasHealthyRoute = snapshot.endpoints.any { it.isHealthyAt(snapshot.generatedAtUnixMs) }

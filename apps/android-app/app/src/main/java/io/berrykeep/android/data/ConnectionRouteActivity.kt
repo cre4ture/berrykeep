@@ -7,13 +7,11 @@ internal fun ConnectionRouteEndpointSnapshot.isHealthyAt(observedAtUnixMs: Long?
         (circuitOpenUntilUnixMs == null || observedAtUnixMs != null && circuitOpenUntilUnixMs <= observedAtUnixMs)
 }
 
-/** A route attempt is recorded before I/O; only a completed success confirms activity. */
+/** Real request completion confirms activity; attempts and health probes cannot. */
 internal fun ConnectionRouteEndpointSnapshot.hasRecentSuccessfulActivity(observedAtUnixMs: Long?): Boolean {
     val observedAt = observedAtUnixMs ?: return false
-    val usedAt = lastUsedUnixMs ?: return false
-    val succeededAt = lastSuccessUnixMs ?: return false
+    val succeededAt = lastSuccessfulUseUnixMs ?: return false
     return isHealthyAt(observedAt) &&
-        succeededAt >= usedAt &&
         (lastFailureUnixMs == null || succeededAt >= lastFailureUnixMs) &&
         succeededAt <= observedAt &&
         observedAt - succeededAt <= ROUTE_ACTIVE_WINDOW_MS

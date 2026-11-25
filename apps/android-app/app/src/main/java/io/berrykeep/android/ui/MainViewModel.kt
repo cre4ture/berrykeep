@@ -607,7 +607,7 @@ class MainViewModel(
                 .filter { endpoint ->
                     endpoint.hasRecentSuccessfulActivity(routes.generatedAtUnixMs)
                 }
-                .sortedByDescending { endpoint -> endpoint.lastUsedUnixMs }
+                .sortedByDescending { endpoint -> endpoint.lastSuccessfulUseUnixMs }
         }.orEmpty()
         return listOf(
             "App version" to BuildConfig.LONG_VERSION,
