@@ -1726,6 +1726,13 @@ fn spawn_iroh_relay_ticket_refresh(
         }
         loop {
             if !lifecycle.relay_ticket_lease.is_active() {
+                // Retirement may race an earlier asynchronous reconciliation.
+                // Apply the now-final empty lease set before stopping its owner.
+                if let Err(error) =
+                    synchronize_iroh_relay_tickets(&endpoint, &mut relay_tickets, &lifecycle).await
+                {
+                    tracing::warn!(%error, "failed removing retired endpoint-bound relay tickets");
+                }
                 return;
             }
             lifecycle.relay_ticket_lease.touch();
