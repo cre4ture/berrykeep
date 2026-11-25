@@ -3,7 +3,7 @@ use client_sdk::remote_sync::RemoteSnapshotFetchProgress;
 use client_sdk::{
     BerryKeepClient, ClientConnectionDiagnostics, ClientIdentityMaterial, ConnectionBootstrap,
     ManagedBerryKeepClient, ManagedClientOptions, RemoteSnapshotFetcher, RemoteSnapshotPoller,
-    RemoteSnapshotScope, RemoteSnapshotUpdate,
+    RemoteSnapshotScope,
 };
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::Serialize;
@@ -34,8 +34,10 @@ use crate::{
 };
 
 pub(crate) mod materialization;
+mod remote_observations;
 #[cfg(test)]
 use materialization::apply_remote_snapshot;
+use remote_observations::{RemoteObservation, SnapshotFreshness};
 
 pub type FolderAgentClientIdentityPersistence = fn(&ClientIdentityMaterial) -> Result<()>;
 
@@ -390,7 +392,7 @@ enum LocalChangeMonitorState {
 }
 
 enum FolderAgentRuntimeEvent {
-    RemoteUpdate(RemoteSnapshotUpdate),
+    RemoteUpdate(RemoteObservation),
     LocalHint,
     Shutdown,
 }
@@ -675,6 +677,7 @@ struct RemoteApplyOutcome {
     downloaded_file_count: usize,
     removed_local_path_count: usize,
     completed_work_count: usize,
+    local_mutation_attempt_count: usize,
 }
 
 impl RemoteApplyOutcome {
@@ -684,6 +687,7 @@ impl RemoteApplyOutcome {
         self.downloaded_file_count += other.downloaded_file_count;
         self.removed_local_path_count += other.removed_local_path_count;
         self.completed_work_count += other.completed_work_count;
+        self.local_mutation_attempt_count += other.local_mutation_attempt_count;
     }
 }
 
@@ -1248,37 +1252,46 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
     let remote_last_success = last_success_shared.clone();
     let remote_idle_message = "Watching for remote changes".to_owned();
     let remote_event_tx = runtime_event_tx.clone();
+    let snapshot_freshness = SnapshotFreshness::default();
+    let fetch_freshness = snapshot_freshness.clone();
+    let delivery_freshness = snapshot_freshness.clone();
+    let refresh_freshness = snapshot_freshness.clone();
 
-    let remote_thread = refresh_poller.spawn_fetcher_loop_with_fetch(
-        remote_running,
-        Some(initial_snapshot),
-        refresh_fetcher,
-        move |refresh_fetcher| {
-            fetch_remote_snapshot_with_status_progress(
-                &remote_options,
-                &remote_connection_target,
-                &remote_storage_mode,
-                &remote_watch_mode,
-                remote_status_callback.as_ref(),
-                "running",
-                "steady-state",
-                "checking-remote-snapshot",
-                "Checking remote snapshot for changes",
-                refresh_fetcher,
-                latest_metrics_value(&remote_latest_metrics),
-                load_optional_unix_ms(&remote_last_success),
-                Some(remote_idle_message.as_str()),
-            )
-        },
-        move |update| {
-            if remote_event_tx
-                .send(FolderAgentRuntimeEvent::RemoteUpdate(update))
-                .is_err()
-            {
-                remote_stop_signal.store(false, Ordering::SeqCst);
-            }
-        },
-    );
+    let remote_thread = refresh_poller
+        .spawn_fetcher_loop_with_fetch_and_unchanged_snapshot_refresh(
+            remote_running,
+            Some(initial_snapshot),
+            refresh_fetcher,
+            move |refresh_fetcher| {
+                fetch_freshness.begin_fetch();
+                fetch_remote_snapshot_with_status_progress(
+                    &remote_options,
+                    &remote_connection_target,
+                    &remote_storage_mode,
+                    &remote_watch_mode,
+                    remote_status_callback.as_ref(),
+                    "running",
+                    "steady-state",
+                    "checking-remote-snapshot",
+                    "Checking remote snapshot for changes",
+                    refresh_fetcher,
+                    latest_metrics_value(&remote_latest_metrics),
+                    load_optional_unix_ms(&remote_last_success),
+                    Some(remote_idle_message.as_str()),
+                )
+            },
+            move |update| {
+                if remote_event_tx
+                    .send(FolderAgentRuntimeEvent::RemoteUpdate(
+                        delivery_freshness.tag(update),
+                    ))
+                    .is_err()
+                {
+                    remote_stop_signal.store(false, Ordering::SeqCst);
+                }
+            },
+            move || refresh_freshness.needs_refresh(),
+        );
 
     let local_change_wake: FolderAgentWakeCallback = Arc::new({
         let runtime_event_tx = runtime_event_tx.clone();
@@ -1292,6 +1305,7 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
         + steady_state_local_scan_interval(options, backend.local_watch_hints_available(options));
     let mut pending_local_scan_hint = false;
     let mut pending_remote_updates = Vec::new();
+    let mut deferred_remote_paths = BTreeSet::new();
     let mut next_materialization_retry = materialization::next_deadline(&materialization_journal)?;
 
     while running.load(Ordering::SeqCst) {
@@ -1308,6 +1322,9 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
         let mut remote_plan_changed = false;
         let mut combined_remote_outcome = RemoteApplyOutcome::default();
         for update in std::mem::take(&mut pending_remote_updates) {
+            let Some(update) = snapshot_freshness.accept(update, &mut deferred_remote_paths) else {
+                continue;
+            };
             let mut remote_pending_metrics =
                 FolderAgentRuntimeMetrics::from_states(Some(&local_state), Some(&remote_index));
             remote_pending_metrics.changed_path_count = usize_to_u64(update.changed_paths.len());
@@ -1343,6 +1360,9 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
                 Some(&remote_refresh_log_context),
             )?;
             remote_updates_applied |= progress.completed_work_count > 0;
+            if progress.local_mutation_attempt_count > 0 {
+                snapshot_freshness.local_mutations_committed();
+            }
             remote_plan_changed = true;
             combined_remote_outcome.accumulate(progress);
         }
@@ -1362,6 +1382,9 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
                 Some(&remote_refresh_log_context),
             )?;
             remote_updates_applied |= progress.completed_work_count > 0;
+            if progress.local_mutation_attempt_count > 0 {
+                snapshot_freshness.local_mutations_committed();
+            }
             combined_remote_outcome.accumulate(progress);
         }
         if remote_plan_changed
@@ -1514,7 +1537,16 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
                         Some(&blocked_paths),
                     )
                 },
-            )?;
+            );
+            // Errors may follow a successful RPC in a multi-step local pass.
+            if local_sync_outcome.as_ref().is_err()
+                || local_sync_outcome
+                    .as_ref()
+                    .is_ok_and(|outcome| !outcome.is_empty())
+            {
+                snapshot_freshness.local_mutations_committed();
+            }
+            let local_sync_outcome = local_sync_outcome?;
             if local_sync_outcome.changed_path_count > 0 {
                 baseline_dirty = true;
             }
@@ -2802,7 +2834,7 @@ fn local_scan_trigger(
 
 fn enqueue_runtime_event(
     event: FolderAgentRuntimeEvent,
-    pending_remote_updates: &mut Vec<RemoteSnapshotUpdate>,
+    pending_remote_updates: &mut Vec<RemoteObservation>,
     pending_local_scan_hint: &mut bool,
 ) -> bool {
     match event {
@@ -2815,7 +2847,7 @@ fn enqueue_runtime_event(
 
 fn drain_runtime_events(
     runtime_event_rx: &mpsc::Receiver<FolderAgentRuntimeEvent>,
-    pending_remote_updates: &mut Vec<RemoteSnapshotUpdate>,
+    pending_remote_updates: &mut Vec<RemoteObservation>,
     pending_local_scan_hint: &mut bool,
 ) -> bool {
     while let Ok(event) = runtime_event_rx.try_recv() {
@@ -2836,7 +2868,7 @@ fn wait_for_runtime_event(
     runtime_event_rx: &mpsc::Receiver<FolderAgentRuntimeEvent>,
     running: &AtomicBool,
     next_local_scan: Instant,
-    pending_remote_updates: &mut Vec<RemoteSnapshotUpdate>,
+    pending_remote_updates: &mut Vec<RemoteObservation>,
     pending_local_scan_hint: &mut bool,
 ) -> bool {
     if !running.load(Ordering::SeqCst) {

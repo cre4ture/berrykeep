@@ -549,6 +549,9 @@ pub(super) fn drain_remote_work<B: FolderAgentLocalBackend>(
                     work.resolution,
                     Some(crate::ConflictResolutionStrategy::KeepLocal)
                 ) {
+                    // A resolution may commit a server mutation before a later
+                    // error or superseded acknowledgement. Fence either case.
+                    item_outcome.local_mutation_attempt_count += 1;
                     resolution::keep_local(
                         backend,
                         options,
@@ -775,6 +778,8 @@ pub(super) fn drain_remote_work<B: FolderAgentLocalBackend>(
                 }
             }
         })?;
+        outcome.local_mutation_attempt_count += item_outcome.local_mutation_attempt_count;
+        item_outcome.local_mutation_attempt_count = 0;
         if !applied {
             tracing::warn!(
                 path = work.path,

@@ -389,7 +389,7 @@ impl RemoteSnapshotPoller {
         )
     }
 
-    fn spawn_fetcher_loop_with_fetch_and_unchanged_snapshot_refresh<F, C, R>(
+    pub fn spawn_fetcher_loop_with_fetch_and_unchanged_snapshot_refresh<F, C, R>(
         &self,
         running: Arc<AtomicBool>,
         initial_snapshot: Option<SyncSnapshot>,
