@@ -237,6 +237,26 @@ export type ClientRendezvousView = {
   endpoint_statuses: ClientRendezvousEndpointStatus[];
 };
 
+export type ClientServiceHealth = {
+  url: string;
+  status: "reachable" | "unhealthy" | "unreachable";
+  checked_at_unix_ms: number;
+  latency_ms: number;
+  http_status: number | null;
+  reported_status: string | null;
+  software_version: string | null;
+  error: string | null;
+};
+
+export type ClientConnectionServicesSnapshot = {
+  generated_at_unix_ms: number;
+  endpoints: {
+    rendezvous: ClientServiceHealth;
+    iroh_relays: ClientServiceHealth[];
+    relay_discovery_error: string | null;
+  }[];
+};
+
 export type ClientDiagnosticLogExport = {
   generated_at_unix: number;
   requested_window_secs: number;
