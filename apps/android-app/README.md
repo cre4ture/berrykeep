@@ -13,6 +13,10 @@ This is the BerryKeep Android app.
   manual "Sync Now" wakes the continuous run instead of starting a competing reconciliation
 - Optional Rust-backed title latency monitor with configurable period; compact `D` (direct) or `R` (relay) result in the app bar
 - App-bar diagnostic export that writes retained Android application events (including sanitized embedded WebView/JavaScript failures), current connection state, and Rust tracing output to a user-selected text file
+- Connection diagnostics and exports mark a route active only when its latest use has
+  a confirmed success within two seconds, with no subsequent failure or active cooldown.
+  Attempt timestamps alone do not establish connectivity; historical successes do not
+  keep the overview available after every previously healthy route has failed.
 
 ## Open in Android Studio
 
