@@ -136,6 +136,22 @@ Suggested responsibilities:
 
 ### 4.3 Relay service
 
+Client Iroh relay leases are budgeted independently per Rendezvous origin and
+local endpoint ID. Admission happens before every ticket request, including
+refreshes. Ticket results retain the issuing control URL separately from the
+advertised relay URLs. A reachable origin can issue a ticket while another
+origin has an unconfirmed release; neither origin's network I/O holds a shared
+admission lock.
+
+Unconfirmed issuance and release results continue to occupy their origin's
+budget. Cleanup retries use exponential backoff and free capacity only after an
+acknowledged release or a known ticket expiry plus a conservative clock grace.
+Ticket workers coalesce concurrent requests for an endpoint and origin and retain
+ownership through consumer cancellation so late responses are accounted for.
+Eviction revokes only the affected origin and immediately notifies the endpoint
+to remove its tickets from the configured relay set. Direct-only QUIC setup with
+usable peer addresses remains available when relay admission fails.
+
 The relay may be part of the rendezvous service at first, but the trust model should treat it as untrusted for payload confidentiality.
 
 Responsibilities:

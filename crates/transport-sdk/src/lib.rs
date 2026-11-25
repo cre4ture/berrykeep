@@ -91,8 +91,8 @@ pub use relay_wake::{
 pub use rendezvous::{
     DiscoveryResponse, IrohRelayAdvertisement, IrohRelayTicket, IrohRelayTicketCollection,
     IrohRelayTicketReleaseRequest, IrohRelayTicketReleaseResponse, IrohRelayTicketRequest,
-    MAX_NODE_CONNECTION_PRIORITY, MIN_NODE_CONNECTION_PRIORITY, NODE_CONNECTION_PRIORITY_LABEL,
-    PresenceEntry, PresenceListResponse, PresenceRegistration,
+    IssuedIrohRelayTicket, MAX_NODE_CONNECTION_PRIORITY, MIN_NODE_CONNECTION_PRIORITY,
+    NODE_CONNECTION_PRIORITY_LABEL, PresenceEntry, PresenceListResponse, PresenceRegistration,
     RENDEZVOUS_IDENTITY_RENEWAL_WINDOW_SECS, RegisterPresenceResponse, RendezvousBackpressure,
     RendezvousClientConfig, RendezvousControlClient, RendezvousEndpointConnectionState,
     RendezvousEndpointStatus, RendezvousRuntimeState, RendezvousServiceHealth,
