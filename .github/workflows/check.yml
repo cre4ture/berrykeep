@@ -213,7 +213,7 @@ jobs:
 
   web-smoke-tests:
     name: Web (${{ matrix.suite.label }})
-    # Keep the browser host within the locked Playwright version's supported OSes.
+    # Playwright 1.58 does not support the Ubuntu 26.04 runner image.
     runs-on: ubuntu-24.04
     needs: workspace-check
     timeout-minutes: 45

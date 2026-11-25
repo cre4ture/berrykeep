@@ -22,6 +22,7 @@ import {
 } from "@berrykeep/api";
 import { PageHeader, StatCard } from "@berrykeep/ui";
 import { useEffect, useMemo, useState } from "react";
+import { ConnectionServicesStatus } from "../components/ConnectionServicesStatus";
 
 type ConnectionSummary = {
   headline: string;
@@ -144,6 +145,8 @@ export function ConnectionPathsPage() {
       />
 
       {error ? <Alert color="red">{error}</Alert> : null}
+
+      <ConnectionServicesStatus />
 
       <Alert color={summary.color} title="Overall search state">
         {summary.detail}
@@ -321,10 +324,10 @@ export function ConnectionPathsPage() {
         <Grid.Col span={{ base: 12, xl: 4 }}>
           <Card withBorder radius="md" padding="lg">
             <Stack gap="md">
-              <Text fw={700}>Relay status</Text>
+              <Text fw={700}>Rendezvous routing</Text>
               <Text size="sm" c="dimmed">
-                Relay-capable routes rely on the shared rendezvous configuration exposed by the
-                runtime.
+                Control-plane history from relay-capable routes. Current service reachability is
+                checked separately above.
               </Text>
 
               <SimpleGrid cols={2}>
@@ -368,7 +371,7 @@ export function ConnectionPathsPage() {
                     <Table.Tr>
                       <Table.Td colSpan={3}>
                         <Text size="sm" c="dimmed">
-                          No relay endpoint snapshot available.
+                          No rendezvous routing snapshot available.
                         </Text>
                       </Table.Td>
                     </Table.Tr>
