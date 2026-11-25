@@ -117,6 +117,7 @@ targets:
         LIBRARY_SEARCH_PATHS: $(PROJECT_DIR)/RustArtifacts/$(PLATFORM_NAME)
         OTHER_LDFLAGS: $(inherited) -lios_app -framework Network -framework SystemConfiguration
         CODE_SIGN_ENTITLEMENTS: Resources/Entitlements/BerryKeepSharedAccess.entitlements
+        CODE_SIGN_IDENTITY: ""
         PRODUCT_BUNDLE_IDENTIFIER: dev.berrykeep.apple.iosapp
         SWIFT_OBJC_BRIDGING_HEADER: Sources/AppleNativeBridge/BerryKeepAppleFFI-Bridging-Header.h
         TARGETED_DEVICE_FAMILY: 1,2
@@ -155,6 +156,7 @@ targets:
         LIBRARY_SEARCH_PATHS: $(PROJECT_DIR)/RustArtifacts/$(PLATFORM_NAME)
         OTHER_LDFLAGS: $(inherited) -lios_app -framework Network -framework SystemConfiguration
         CODE_SIGN_ENTITLEMENTS: Resources/Entitlements/BerryKeepSharedAccess.entitlements
+        CODE_SIGN_IDENTITY: ""
         PRODUCT_BUNDLE_IDENTIFIER: dev.berrykeep.apple.iosapp.fileprovider
         SWIFT_OBJC_BRIDGING_HEADER: Sources/AppleNativeBridge/BerryKeepAppleFFI-Bridging-Header.h
         TARGETED_DEVICE_FAMILY: 1,2
