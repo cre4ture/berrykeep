@@ -334,13 +334,12 @@ impl CfapiWork {
 
     fn apply_mutation(&self, uploader: &dyn Uploader, intent: &LocalMutation) -> WorkResult {
         use crate::placeholder_metadata::RemoteObjectResolution;
-        let gates = intent
-            .paths()
-            .into_iter()
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .map(|path| crate::path_operations::gate(&self.root.join(path.replace('/', "\\"))))
-            .collect::<Vec<_>>();
+        let gates = crate::path_operations::gates(
+            intent
+                .paths()
+                .into_iter()
+                .map(|path| self.root.join(path.replace('/', "\\"))),
+        );
         let _path_operations = gates
             .iter()
             .map(|gate| gate.lock().unwrap_or_else(|e| e.into_inner()))

@@ -68,14 +68,11 @@ impl CfapiWork {
         if work.availability != ContentAvailability::MetadataOnly {
             anyhow::bail!("CFAPI namespace executor requires metadata availability");
         }
-        let gates = work
-            .actions
-            .iter()
-            .map(action_path)
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .map(|path| crate::path_operations::gate(&self.root.join(path.replace('/', "\\"))))
-            .collect::<Vec<_>>();
+        let gates = crate::path_operations::gates(
+            work.actions
+                .iter()
+                .map(|action| self.root.join(action_path(action).replace('/', "\\"))),
+        );
         let _path_operations = gates
             .iter()
             .map(|gate| gate.lock().unwrap_or_else(|e| e.into_inner()))
