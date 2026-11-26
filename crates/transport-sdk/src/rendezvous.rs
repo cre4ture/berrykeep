@@ -6,6 +6,7 @@ use rustls_pki_types::CertificateDer;
 use rustls_pki_types::pem::PemObject;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::HashMap;
+use std::future::Future;
 use std::io::Cursor;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -290,20 +291,84 @@ impl IrohRelayTicket {
 /// endpoints. The first ticket is available immediately; further valid tickets
 /// can be consumed as their concurrent requests complete.
 pub struct IrohRelayTicketCollection {
-    first_ticket: IrohRelayTicket,
-    additional_tickets: tokio::sync::mpsc::UnboundedReceiver<Result<IrohRelayTicket>>,
+    first_ticket: IssuedIrohRelayTicket,
+    additional_tickets: tokio::sync::mpsc::UnboundedReceiver<Result<IssuedIrohRelayTicket>>,
     _collection_task: AbortOnDrop,
+}
+
+/// Local provenance of a ticket; relay public URLs need not identify its issuer.
+#[derive(Debug, Clone)]
+pub struct IssuedIrohRelayTicket {
+    pub rendezvous_url: String,
+    pub ticket: IrohRelayTicket,
 }
 
 impl IrohRelayTicketCollection {
     pub fn first_ticket(&self) -> &IrohRelayTicket {
-        &self.first_ticket
+        &self.first_ticket.ticket
+    }
+
+    pub fn first_ticket_rendezvous_url(&self) -> &str {
+        &self.first_ticket.rendezvous_url
     }
 
     /// Returns the next result from a request that was already started in
     /// parallel with the request that produced [`Self::first_ticket`].
     pub async fn next_ticket(&mut self) -> Option<Result<IrohRelayTicket>> {
+        self.next_ticket_with_origin()
+            .await
+            .map(|result| result.map(|issued| issued.ticket))
+    }
+
+    pub async fn next_ticket_with_origin(&mut self) -> Option<Result<IssuedIrohRelayTicket>> {
         self.additional_tickets.recv().await
+    }
+
+    /// Collect independently admitted requests without delaying the first valid ticket.
+    pub async fn from_requests<F>(requests: Vec<(String, F)>) -> Result<Self>
+    where
+        F: Future<Output = Result<IrohRelayTicket>> + Send + 'static,
+    {
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            let mut attempts = requests
+                .into_iter()
+                .map(|(rendezvous_url, request)| async move {
+                    request.await.map(|ticket| IssuedIrohRelayTicket {
+                        rendezvous_url,
+                        ticket,
+                    })
+                })
+                .collect::<FuturesUnordered<_>>();
+            while let Some(result) = attempts.next().await {
+                if sender.send(result).is_err() {
+                    break;
+                }
+            }
+        });
+        let collection_task = AbortOnDrop {
+            abort_handle: task.abort_handle(),
+        };
+        let mut last_error = None;
+        let mut backpressure_error = None;
+        while let Some(result) = receiver.recv().await {
+            match result {
+                Ok(first_ticket) => {
+                    return Ok(Self {
+                        first_ticket,
+                        additional_tickets: receiver,
+                        _collection_task: collection_task,
+                    });
+                }
+                Err(error) if is_rendezvous_backpressure(&error) => {
+                    backpressure_error = Some(error)
+                }
+                Err(error) => last_error = Some(error),
+            }
+        }
+        Err(backpressure_error
+            .or(last_error)
+            .unwrap_or_else(|| anyhow!("no admitted rendezvous ticket requests")))
     }
 }
 
@@ -517,6 +582,19 @@ impl RendezvousControlClient {
 
     pub fn config(&self) -> &RendezvousClientConfig {
         &self.config
+    }
+
+    /// Restrict operations to one configured endpoint while retaining HTTP and health state.
+    pub fn for_endpoint(&self, base_url: &str) -> Result<Self> {
+        let configured = self
+            .config
+            .rendezvous_urls
+            .iter()
+            .find(|url| normalized_endpoint_url(url) == normalized_endpoint_url(base_url))
+            .with_context(|| format!("rendezvous endpoint {base_url:?} is not configured"))?;
+        let mut client = self.clone();
+        client.config.rendezvous_urls = vec![configured.clone()];
+        Ok(client)
     }
 
     pub fn runtime_state(&self) -> RendezvousRuntimeState {
@@ -789,52 +867,22 @@ impl RendezvousControlClient {
         };
         request.validate()?;
 
-        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-        let client = self.clone();
-        let task = tokio::spawn(async move {
-            let mut attempts = FuturesUnordered::new();
-            for base_url in &client.config.rendezvous_urls {
-                let client = client.clone();
+        let requests = self
+            .config
+            .rendezvous_urls
+            .iter()
+            .map(|base_url| {
+                let client = self.clone();
                 let base_url = base_url.clone();
                 let request = request.clone();
-                attempts.push(async move {
+                (base_url.clone(), async move {
                     client
                         .issue_iroh_relay_ticket_from_endpoint(base_url, request)
                         .await
-                });
-            }
-
-            while let Some(result) = attempts.next().await {
-                if sender.send(result).is_err() {
-                    break;
-                }
-            }
-        });
-        let collection_task = AbortOnDrop {
-            abort_handle: task.abort_handle(),
-        };
-        let mut last_error = None;
-        let mut backpressure_error = None;
-
-        while let Some(result) = receiver.recv().await {
-            match result {
-                Ok(first_ticket) => {
-                    return Ok(IrohRelayTicketCollection {
-                        first_ticket,
-                        additional_tickets: receiver,
-                        _collection_task: collection_task,
-                    });
-                }
-                Err(error) if is_rendezvous_backpressure(&error) => {
-                    backpressure_error = Some(error)
-                }
-                Err(error) => last_error = Some(error),
-            }
-        }
-
-        Err(backpressure_error
-            .or(last_error)
-            .unwrap_or_else(|| anyhow!("rendezvous client has no configured URLs")))
+                })
+            })
+            .collect();
+        IrohRelayTicketCollection::from_requests(requests).await
     }
 
     pub async fn publish_bootstrap_claim(
@@ -2062,6 +2110,10 @@ mod tests {
         .expect("first ticket should not wait for the slow rendezvous endpoint")
         .expect("fast rendezvous endpoint should issue a valid ticket");
         assert_eq!(tickets.first_ticket().auth_token, "fast-endpoint-ticket");
+        assert_eq!(
+            tickets.first_ticket_rendezvous_url(),
+            format!("http://{fast_addr}")
+        );
 
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             while slow_request_started.load(std::sync::atomic::Ordering::SeqCst) == 0 {
@@ -2072,18 +2124,46 @@ mod tests {
         .expect("slow request should have started alongside the fast request");
         release_slow_response.notify_one();
 
-        let slow_ticket =
-            tokio::time::timeout(std::time::Duration::from_secs(1), tickets.next_ticket())
-                .await
-                .expect("slow valid ticket should arrive after the first ticket")
-                .expect("ticket collection should still be open")
-                .expect("slow rendezvous endpoint should issue a valid ticket");
-        assert_eq!(slow_ticket.auth_token, "strato-endpoint-ticket");
+        let slow_ticket = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            tickets.next_ticket_with_origin(),
+        )
+        .await
+        .expect("slow valid ticket should arrive after the first ticket")
+        .expect("ticket collection should still be open")
+        .expect("slow rendezvous endpoint should issue a valid ticket");
+        assert_eq!(slow_ticket.rendezvous_url, format!("http://{slow_addr}"));
+        assert_eq!(slow_ticket.ticket.auth_token, "strato-endpoint-ticket");
 
         slow_server.abort();
         let _ = slow_server.await;
         fast_server.abort();
         let _ = fast_server.await;
+    }
+
+    #[tokio::test]
+    async fn scoped_rendezvous_client_preserves_health_and_rejects_unconfigured_endpoints() {
+        let client = RendezvousControlClient::new(
+            RendezvousClientConfig {
+                cluster_id: ClusterId::now_v7(),
+                rendezvous_urls: vec![
+                    "http://127.0.0.1:10001".into(),
+                    "http://127.0.0.1:10002".into(),
+                ],
+                heartbeat_interval_secs: 15,
+            },
+            None,
+            None,
+        )
+        .unwrap();
+        let scoped = client.for_endpoint("http://127.0.0.1:10002/").unwrap();
+        assert_eq!(
+            scoped.config().rendezvous_urls,
+            vec!["http://127.0.0.1:10002"]
+        );
+        assert_eq!(scoped.config().cluster_id, client.config().cluster_id);
+        assert!(Arc::ptr_eq(&client.runtime_state, &scoped.runtime_state));
+        assert!(client.for_endpoint("http://unconfigured.invalid").is_err());
     }
 
     #[tokio::test]

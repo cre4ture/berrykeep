@@ -19,6 +19,7 @@ import io.berrykeep.android.api.StoreIndexResponse
 import io.berrykeep.android.api.StoreIndexSortOrder
 import io.berrykeep.android.data.AppConnectionStatus
 import io.berrykeep.android.data.ConnectionRouteSnapshot
+import io.berrykeep.android.data.hasRecentSuccessfulActivity
 import io.berrykeep.android.data.AndroidDiagnosticLog as Log
 import io.berrykeep.android.data.writeAndroidDiagnosticLogExport
 import io.berrykeep.android.data.DeviceAuthState
@@ -604,12 +605,9 @@ class MainViewModel(
         val activeRoutes = state.connectionRoutes?.let { routes ->
             routes.endpoints
                 .filter { endpoint ->
-                    endpoint.lastUsedUnixMs?.let { lastUsed ->
-                        lastUsed <= routes.generatedAtUnixMs &&
-                            routes.generatedAtUnixMs - lastUsed <= 2_000L
-                    } == true
+                    endpoint.hasRecentSuccessfulActivity(routes.generatedAtUnixMs)
                 }
-                .sortedByDescending { endpoint -> endpoint.lastUsedUnixMs }
+                .sortedByDescending { endpoint -> endpoint.lastSuccessfulUseUnixMs }
         }.orEmpty()
         return listOf(
             "App version" to BuildConfig.LONG_VERSION,

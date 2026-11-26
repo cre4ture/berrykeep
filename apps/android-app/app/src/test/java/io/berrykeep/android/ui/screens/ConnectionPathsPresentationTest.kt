@@ -184,7 +184,7 @@ class ConnectionPathsPresentationTest {
     }
 
     @Test
-    fun reportsEveryRouteUsedWithinTwoSecondsAsActive() {
+    fun reportsEveryRouteSuccessfullyUsedWithinTwoSecondsAsActive() {
         val snapshot = ConnectionRouteSnapshot(
             generatedAtUnixMs = 10_000L,
             rankedIndices = listOf(0, 1, 2),
@@ -221,6 +221,115 @@ class ConnectionPathsPresentationTest {
         assertEquals(ConnectionOverviewState.AVAILABLE, presentation.overview.state)
         assertEquals(0, presentation.overview.activeRouteCount)
         assertEquals(ConnectionRouteState.AVAILABLE, presentation.routes.single().state)
+    }
+
+    @Test
+    fun doesNotCountFailedOrUnconfirmedAttemptsAsActiveConnections() {
+        val snapshot = ConnectionRouteSnapshot(
+            generatedAtUnixMs = 10_000L,
+            rankedIndices = listOf(0, 1, 2, 3),
+            endpoints = listOf(
+                endpoint(index = 0, lastUsedUnixMs = 9_900L),
+                endpoint(
+                    index = 1,
+                    lastUsedUnixMs = 9_900L,
+                    totalSuccesses = 1L,
+                    lastSuccessUnixMs = 1_000L,
+                ),
+                endpoint(
+                    index = 2,
+                    lastUsedUnixMs = 9_900L,
+                    totalSuccesses = 1L,
+                    lastSuccessUnixMs = 9_800L,
+                    totalFailures = 1L,
+                    consecutiveFailures = 1,
+                    circuitOpenUntilUnixMs = 11_000L,
+                ),
+                endpoint(
+                    index = 3,
+                    lastUsedUnixMs = 9_900L,
+                    totalFailures = 1L,
+                    consecutiveFailures = 1,
+                ),
+            ),
+        )
+
+        val presentation = connectionPathsPresentation(snapshot, error = null)
+
+        assertEquals(0, presentation.overview.activeRouteCount)
+        assertEquals(ConnectionOverviewState.AVAILABLE, presentation.overview.state)
+        assertEquals(
+            mapOf(
+                0 to ConnectionRouteState.UNKNOWN,
+                1 to ConnectionRouteState.AVAILABLE,
+                2 to ConnectionRouteState.COOL_DOWN,
+                3 to ConnectionRouteState.UNAVAILABLE,
+            ),
+            presentation.routes.associate { it.endpoint.index to it.state },
+        )
+    }
+
+    @Test
+    fun failedFailoverAttemptsDoNotTurnOneWorkingConnectionIntoMultipleConnections() {
+        val presentation = connectionPathsPresentation(
+            snapshot = ConnectionRouteSnapshot(
+                generatedAtUnixMs = 10_000L,
+                endpoints = listOf(
+                    endpoint(index = 0, lastUsedUnixMs = 9_900L, totalSuccesses = 1L),
+                    endpoint(index = 1, lastUsedUnixMs = 9_950L, totalFailures = 1L, consecutiveFailures = 1),
+                ),
+            ),
+            error = null,
+        )
+
+        assertEquals(ConnectionOverviewState.DIRECT, presentation.overview.state)
+        assertEquals(1, presentation.overview.activeRouteCount)
+        assertEquals(0, presentation.overview.displayRoute?.index)
+    }
+
+    @Test
+    fun measuresSuccessfulActivityFromCompletionOfALongRunningRequest() {
+        val route = endpoint(
+            index = 0,
+            lastUsedUnixMs = 1_000L,
+            totalSuccesses = 1L,
+            lastSuccessUnixMs = 9_900L,
+        )
+
+        assertEquals(ConnectionRouteState.ACTIVE, connectionRouteState(route, 10_000L))
+        assertEquals(ConnectionRouteState.AVAILABLE, connectionRouteState(route, 12_000L))
+    }
+
+    @Test
+    fun reportsAnOutageAfterPreviouslySuccessfulRoutesHaveFailed() {
+        val presentation = connectionPathsPresentation(
+            snapshot = ConnectionRouteSnapshot(
+                generatedAtUnixMs = 10_000L,
+                endpoints = listOf(
+                    endpoint(
+                        index = 0,
+                        lastUsedUnixMs = 9_900L,
+                        totalSuccesses = 5L,
+                        lastSuccessUnixMs = 1_000L,
+                        totalFailures = 2L,
+                        consecutiveFailures = 2,
+                    ),
+                ),
+            ),
+            error = null,
+        )
+
+        assertEquals(ConnectionOverviewState.UNAVAILABLE, presentation.overview.state)
+        assertEquals(0, presentation.overview.activeRouteCount)
+    }
+
+    @Test
+    fun doesNotTreatBackgroundProbeSuccessOrFutureTimestampsAsActiveTraffic() {
+        val probeOnly = endpoint(index = 0, totalSuccesses = 1L, lastSuccessUnixMs = 9_900L)
+        val futureSuccess = endpoint(index = 1, lastUsedUnixMs = 9_900L, totalSuccesses = 1L, lastSuccessUnixMs = 10_001L)
+
+        assertEquals(ConnectionRouteState.AVAILABLE, connectionRouteState(probeOnly, 10_000L))
+        assertEquals(ConnectionRouteState.AVAILABLE, connectionRouteState(futureSuccess, 10_000L))
     }
 
     @Test
@@ -267,6 +376,8 @@ class ConnectionPathsPresentationTest {
         ewmaLatencyMs: Double? = null,
         ewmaThroughputBytesPerSec: Double? = null,
         totalSuccesses: Long = 0L,
+        lastSuccessUnixMs: Long? = if (totalSuccesses > 0L) lastUsedUnixMs else null,
+        lastSuccessfulUseUnixMs: Long? = if (lastUsedUnixMs != null) lastSuccessUnixMs else null,
         totalFailures: Long = 0L,
         consecutiveFailures: Int = 0,
         circuitOpenUntilUnixMs: Long? = null,
@@ -286,6 +397,8 @@ class ConnectionPathsPresentationTest {
             consecutiveFailures = consecutiveFailures,
             totalFailures = totalFailures,
             totalSuccesses = totalSuccesses,
+            lastSuccessUnixMs = lastSuccessUnixMs,
+            lastSuccessfulUseUnixMs = lastSuccessfulUseUnixMs,
             circuitOpenUntilUnixMs = circuitOpenUntilUnixMs,
             backgroundProbeInFlight = false,
         )

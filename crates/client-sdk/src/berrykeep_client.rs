@@ -610,6 +610,8 @@ struct ClientEndpointState {
     /// Most recent real request attempt on this route. Synthetic background
     /// probes deliberately do not update this value.
     last_used_unix_ms: Option<u64>,
+    /// Completion of real traffic, including auxiliary requests, never health probes.
+    last_successful_use_unix_ms: Option<u64>,
     last_user_facing_success_unix_ms: Option<u64>,
     last_user_facing_success_url: Option<String>,
     last_failure_unix_ms: Option<u64>,
@@ -769,6 +771,9 @@ pub struct ClientConnectionRouteEndpointSnapshot {
     pub last_success_unix_ms: Option<u64>,
     #[serde(default)]
     pub last_used_unix_ms: Option<u64>,
+    /// Last completed real request; unlike `last_success_unix_ms`, excludes probes.
+    #[serde(default)]
+    pub last_successful_use_unix_ms: Option<u64>,
     #[serde(default)]
     pub last_failure_unix_ms: Option<u64>,
     #[serde(default)]
@@ -1704,6 +1709,7 @@ impl ClientEndpointRouter {
         let first_relay_connection =
             state.total_successes == 0 && endpoint.transport.relay_target_node_id().is_some();
         record_endpoint_success_sample(&mut state, route_latency_ms, response_bytes, false);
+        state.last_successful_use_unix_ms = Some(unix_ts_ms());
         drop(state);
         if first_relay_connection {
             self.notify_first_relay_connection(index, endpoint);
@@ -1794,6 +1800,7 @@ impl ClientEndpointRouter {
                     last_measurement_unix_ms: state.last_measurement_unix_ms,
                     last_success_unix_ms: state.last_success_unix_ms,
                     last_used_unix_ms: state.last_used_unix_ms,
+                    last_successful_use_unix_ms: state.last_successful_use_unix_ms,
                     last_failure_unix_ms: state.last_failure_unix_ms,
                     circuit_open_until_unix_ms: state.circuit.open_until(),
                     background_probe_in_flight: state.probe.is_in_flight(),
@@ -1857,6 +1864,7 @@ impl ClientEndpointRouter {
         let first_relay_connection =
             state.total_successes == 0 && endpoint.transport.relay_target_node_id().is_some();
         let finished_unix_ms = unix_ts_ms();
+        state.last_successful_use_unix_ms = Some(finished_unix_ms);
         let timing = ClientRequestSuccessTiming::measure(endpoint, attempt, &measurement);
         record_endpoint_success_sample(
             &mut state,

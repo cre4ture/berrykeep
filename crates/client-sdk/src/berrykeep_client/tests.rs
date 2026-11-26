@@ -696,6 +696,58 @@ fn background_probe_failures_are_scoped_as_maintenance_attempts() {
 }
 
 #[test]
+fn route_activity_records_completed_requests_not_probes_or_inflight_attempts() {
+    let client = BerryKeepClient::from_direct_base_url("http://127.0.0.1:18080/");
+    let endpoint = client.transport_router.endpoint(0).unwrap();
+    let snapshot = || serde_json::to_value(client.connection_route_snapshot()).unwrap();
+    client
+        .transport_router
+        .record_background_probe_successes(0, &[1.0, 2.0]);
+    assert!(snapshot()["endpoints"][0]["last_successful_use_unix_ms"].is_null());
+
+    let request_url = client.relative_url("/api/v1/cluster/status").unwrap();
+    let completed = client.record_request_success(
+        0,
+        &endpoint,
+        ClientRequestAttemptContext {
+            method: &Method::GET,
+            url: &request_url,
+            timeout: None,
+            started_unix_ms: unix_ts_ms().saturating_sub(1_000),
+            session_pool_before: TransportSessionPoolSnapshot::default(),
+        },
+        ClientRequestSuccessMeasurement {
+            total_duration_ms: 1_000.0,
+            request_bytes: 0,
+            response_bytes: 100,
+            status: StatusCode::OK,
+            response_headers: &HeaderMap::new(),
+            response_body_complete: true,
+        },
+    );
+    let traffic_completion = snapshot()["endpoints"][0]["last_successful_use_unix_ms"].as_u64();
+    assert_eq!(traffic_completion, completed.attempt.finished_unix_ms);
+    client.record_route_used(0, &endpoint, traffic_completion.unwrap() + 50);
+    client
+        .transport_router
+        .record_background_probe_successes(0, &[1.0, 2.0]);
+    assert_eq!(
+        snapshot()["endpoints"][0]["last_successful_use_unix_ms"].as_u64(),
+        traffic_completion
+    );
+
+    let auxiliary = BerryKeepClient::from_direct_base_url("http://127.0.0.1:18081/");
+    let endpoint = auxiliary.transport_router.endpoint(0).unwrap();
+    auxiliary.record_transport_success_without_diagnostics(0, &endpoint, 5.0, 100);
+    let snapshot = serde_json::to_value(auxiliary.connection_route_snapshot()).unwrap();
+    assert!(
+        snapshot["endpoints"][0]["last_successful_use_unix_ms"]
+            .as_u64()
+            .is_some()
+    );
+}
+
+#[test]
 fn connection_diagnostics_timestamp_does_not_precede_last_route_use() {
     let client = BerryKeepClient::from_direct_base_url("http://127.0.0.1:18080/");
     let endpoint = client

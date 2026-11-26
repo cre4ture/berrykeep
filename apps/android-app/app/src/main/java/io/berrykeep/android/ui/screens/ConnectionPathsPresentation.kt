@@ -2,6 +2,8 @@ package io.berrykeep.android.ui.screens
 
 import io.berrykeep.android.data.ConnectionRouteEndpointSnapshot
 import io.berrykeep.android.data.ConnectionRouteSnapshot
+import io.berrykeep.android.data.hasRecentSuccessfulActivity
+import io.berrykeep.android.data.isHealthyAt
 
 internal enum class ConnectionOverviewState {
     CHECKING,
@@ -126,17 +128,18 @@ internal fun connectionOverview(
     }
 
     val activeRoutes = orderedEndpoints.filter { endpoint ->
-        wasRecentlyUsed(endpoint, snapshot.generatedAtUnixMs)
+        endpoint.hasRecentSuccessfulActivity(snapshot.generatedAtUnixMs)
     }
-    val active = activeRoutes.maxByOrNull { endpoint -> endpoint.lastUsedUnixMs ?: Long.MIN_VALUE }
+    val active = activeRoutes.maxByOrNull { endpoint -> endpoint.lastSuccessfulUseUnixMs ?: Long.MIN_VALUE }
     val displayRoute = active ?: orderedEndpoints.firstOrNull()
     val hasSuccess = snapshot.endpoints.any { it.totalSuccesses > 0L }
+    val hasHealthyRoute = snapshot.endpoints.any { it.isHealthyAt(snapshot.generatedAtUnixMs) }
     val hasProbeInFlight = snapshot.endpoints.any { it.backgroundProbeInFlight }
     val hasCoolingRoute = snapshot.endpoints.any { isCoolingDown(it, snapshot.generatedAtUnixMs) }
 
     val state = when {
         !hasSuccess && snapshot.endpoints.all { it.totalFailures == 0L } -> ConnectionOverviewState.CHECKING
-        !hasSuccess -> ConnectionOverviewState.UNAVAILABLE
+        !hasHealthyRoute -> ConnectionOverviewState.UNAVAILABLE
         activeRoutes.size > 1 -> ConnectionOverviewState.MULTIPLE
         active != null &&
             isRelayPath(active) &&
@@ -174,7 +177,7 @@ internal fun connectionRouteState(
     snapshotUnixMs: Long?,
 ): ConnectionRouteState {
     return when {
-        wasRecentlyUsed(endpoint, snapshotUnixMs) -> ConnectionRouteState.ACTIVE
+        endpoint.hasRecentSuccessfulActivity(snapshotUnixMs) -> ConnectionRouteState.ACTIVE
         isCoolingDown(endpoint, snapshotUnixMs) -> ConnectionRouteState.COOL_DOWN
         endpoint.backgroundProbeInFlight -> ConnectionRouteState.CHECKING
         endpoint.totalSuccesses > 0L && endpoint.consecutiveFailures == 0 -> ConnectionRouteState.AVAILABLE
@@ -263,16 +266,6 @@ internal fun routeScoreBreakdown(endpoint: ConnectionRouteEndpointSnapshot): Rou
     )
 }
 
-internal fun wasRecentlyUsed(
-    endpoint: ConnectionRouteEndpointSnapshot,
-    snapshotUnixMs: Long?,
-): Boolean {
-    val lastUsedUnixMs = endpoint.lastUsedUnixMs ?: return false
-    val observedAtUnixMs = snapshotUnixMs ?: return false
-    return lastUsedUnixMs <= observedAtUnixMs &&
-        observedAtUnixMs - lastUsedUnixMs <= ROUTE_ACTIVE_WINDOW_MS
-}
-
 internal fun isCoolingDown(
     endpoint: ConnectionRouteEndpointSnapshot,
     snapshotUnixMs: Long?,
@@ -344,6 +337,5 @@ private const val ROUTE_RELAY_PENALTY_POINTS = 500.0
 private const val ROUTE_FAILURE_PENALTY_POINTS = 250.0
 private const val ROUTE_THROUGHPUT_BYTES_PER_POINT = 250_000.0
 private const val ROUTE_MAX_THROUGHPUT_CREDIT_POINTS = 50.0
-internal const val ROUTE_ACTIVE_WINDOW_MS = 2_000L
 private const val HOLE_PUNCHING_MODE_DIRECT = "direct"
 private const val HOLE_PUNCHING_MODE_RELAY = "relay"

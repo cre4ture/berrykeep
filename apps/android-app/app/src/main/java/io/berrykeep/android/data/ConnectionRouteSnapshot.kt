@@ -46,6 +46,8 @@ data class ConnectionRouteEndpointSnapshot(
     val lastSuccessUnixMs: Long? = null,
     @Json(name = "last_used_unix_ms")
     val lastUsedUnixMs: Long? = null,
+    @Json(name = "last_successful_use_unix_ms")
+    val lastSuccessfulUseUnixMs: Long? = null,
     @Json(name = "last_failure_unix_ms")
     val lastFailureUnixMs: Long? = null,
     @Json(name = "circuit_open_until_unix_ms")

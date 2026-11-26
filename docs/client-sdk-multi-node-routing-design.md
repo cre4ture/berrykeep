@@ -133,6 +133,13 @@ Existing helper methods keep representing the current active route:
 
 This preserves current CLI and web-backend expectations.
 
+Route snapshots distinguish attempt starts (`last_used_unix_ms`), successful
+health measurements including probes (`last_success_unix_ms`), and completed
+real requests including auxiliary traffic (`last_successful_use_unix_ms`).
+Android activity labels use the last real completion within two seconds and
+exclude subsequent failures or cooldowns. A health probe cannot restart that
+activity window, and a new in-flight request does not clear a recent completion.
+
 ## Failure handling
 
 Target failover should ignore the exact transport failure class from the caller perspective.
