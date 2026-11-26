@@ -1588,7 +1588,7 @@ mod tests {
             "00000000-0000-0000-0000-0000000000a1".to_string(),
             3,
             Some("quorum"),
-            Some(1),
+            Some(5),
             &[],
         )
         .await?;
@@ -1651,13 +1651,10 @@ mod tests {
                 .context("missing provisional version id")?
                 .to_string();
 
-            sleep(Duration::from_millis(2_300)).await;
-            fixture
-                .http
-                .request(Method::GET, "/cluster/status")?
-                .send()
-                .await?
-                .error_for_status()?;
+            // Observe quorum loss rather than assuming both synthetic peers expired
+            // during a fixed sleep. Leave enough time for the authenticated commit
+            // after the recovery heartbeat, including on instrumented CI runners.
+            wait_for_online_nodes(&client, &fixture.http.base_url, 1, 160).await?;
 
             let rejected = fixture
                 .http
