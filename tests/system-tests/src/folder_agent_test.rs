@@ -1527,7 +1527,21 @@ async fn folder_agent_detects_local_add_and_modify_done_while_stopped_after_rest
         })?;
         let mut first_run =
             start_folder_agent(&fixture.connection, &local_root, None, 2_000, 250, true).await?;
+        // Exercise a restart from a completed baseline, rather than racing SIGTERM
+        // against the first scan on slower or coverage-instrumented runners.
+        let baseline = async {
+            wait_for_remote_file_bytes(&sdk, "local-offline/new1.txt", b"offline-v1", 220).await?;
+            wait_for_baseline_content_hash(
+                &local_root,
+                fixture.connection.target_label(),
+                "local-offline/new1.txt",
+                240,
+            )
+            .await
+        }
+        .await;
         stop_folder_agent(&mut first_run).await;
+        baseline?;
 
         fs::create_dir_all(local_root.join("local-offline2")).with_context(|| {
             format!(
