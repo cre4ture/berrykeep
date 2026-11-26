@@ -7955,7 +7955,7 @@ async fn enroll_client_device_fails_closed_when_relay_identity_signer_is_unavail
 }
 
 #[tokio::test]
-async fn client_identity_issuance_defaults_to_ninety_days_and_preserves_explicit_expiry() {
+async fn client_identity_issuance_uses_ninety_day_default_and_validates_explicit_expiry() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
     let (cluster_ca_pem, internal_ca_key_pem) = generate_test_internal_ca();
     state.network.cluster_ca_pem = Some(cluster_ca_pem);
@@ -7985,6 +7985,59 @@ async fn client_identity_issuance_defaults_to_ninety_days_and_preserves_explicit
             None => assert_eq!(not_after - issued_at, 90 * 24 * 60 * 60),
         }
     }
+
+    let error = super::issue_client_rendezvous_identity_pem(
+        &state,
+        &Uuid::now_v7().to_string(),
+        Some(super::unix_ts() - 1),
+    )
+    .expect_err("an explicitly expired certificate limit must fail closed");
+    assert!(error.to_string().contains("expired"));
+
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn client_identity_renewal_extends_validity_and_requires_active_device() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let (cluster_ca_pem, internal_ca_key_pem) = generate_test_internal_ca();
+    state.network.cluster_ca_pem = Some(cluster_ca_pem);
+    state.network.internal_ca_key_pem = Some(internal_ca_key_pem);
+    state.network.relay_mode = super::RelayMode::Required;
+    let device_id = Uuid::now_v7().to_string();
+    let mut record =
+        super::imported_client_credential_record(sample_replicated_client_credential(&device_id))
+            .unwrap();
+    let original_expiry = super::unix_ts() + 10 * 24 * 60 * 60;
+    record.issued_credential_pem = Some(format!("expires_at_unix={original_expiry}\n"));
+    state
+        .access
+        .client_credentials
+        .lock()
+        .await
+        .credentials
+        .push(record);
+
+    let renewal_started_at = super::unix_ts();
+    let response = super::renew_device_rendezvous_identity_response(&state, &device_id).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let pem = payload["rendezvous_client_identity_pem"].as_str().unwrap();
+    let not_after =
+        transport_sdk::rendezvous_client_identity_not_after_unix(pem.as_bytes()).unwrap();
+    assert!(not_after >= renewal_started_at + 90 * 24 * 60 * 60);
+    assert!(!transport_sdk::rendezvous_client_identity_needs_renewal_at(
+        pem.as_bytes(),
+        renewal_started_at,
+    ));
+
+    state.access.client_credentials.lock().await.credentials[0].revoked_at_unix =
+        Some(super::unix_ts());
+    let revoked = super::renew_device_rendezvous_identity_response(&state, &device_id).await;
+    assert_eq!(revoked.status(), StatusCode::UNAUTHORIZED);
+    let unknown = super::renew_device_rendezvous_identity_response(&state, "unknown").await;
+    assert_eq!(unknown.status(), StatusCode::UNAUTHORIZED);
 
     cleanup_test_state(&state).await;
 }

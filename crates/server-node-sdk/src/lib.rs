@@ -2378,9 +2378,11 @@ fn issue_client_rendezvous_identity_pem(
         .context("failed to build rendezvous client certificate issuer")?;
 
     let issued_at_unix = unix_ts();
-    let not_after_unix = expires_at_unix
-        .filter(|value| *value > issued_at_unix)
-        .unwrap_or_else(|| issued_at_unix + DEFAULT_CLIENT_IDENTITY_VALIDITY_SECS);
+    let not_after_unix = match expires_at_unix {
+        Some(value) if value > issued_at_unix => value,
+        Some(value) => bail!("rendezvous client certificate expiry {value} is already expired"),
+        None => issued_at_unix + DEFAULT_CLIENT_IDENTITY_VALIDITY_SECS,
+    };
 
     let mut params =
         CertificateParams::new(Vec::new()).context("failed to initialize client cert params")?;
@@ -27915,17 +27917,24 @@ async fn renew_device_rendezvous_identity_response(
     state: &ServerState,
     device_id: &str,
 ) -> Response {
-    let expires_at_unix = {
+    let active_device = {
         let auth_state = state.access.client_credentials.lock().await;
         auth_state
             .credentials
             .iter()
-            .find(|r| r.device_id == device_id && r.revoked_at_unix.is_none())
-            .and_then(|r| r.issued_credential_pem.as_deref())
-            .and_then(parse_credential_pem_expires_at)
+            .any(|record| record.device_id == device_id && record.revoked_at_unix.is_none())
     };
+    if !active_device {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "device is not registered or has been revoked" })),
+        )
+            .into_response();
+    }
 
-    match issue_client_rendezvous_identity_pem(state, device_id, expires_at_unix) {
+    // Request authentication proves the durable device identity. Give each transport certificate
+    // a fresh lifetime instead of capping every renewal at the original enrollment timestamp.
+    match issue_client_rendezvous_identity_pem(state, device_id, None) {
         Ok(Some(pem)) => (
             StatusCode::OK,
             Json(json!({ "rendezvous_client_identity_pem": pem })),
@@ -27942,13 +27951,6 @@ async fn renew_device_rendezvous_identity_response(
         )
             .into_response(),
     }
-}
-
-fn parse_credential_pem_expires_at(credential_pem: &str) -> Option<u64> {
-    credential_pem.lines().find_map(|line| {
-        line.strip_prefix("expires_at_unix=")
-            .and_then(|v| v.trim().parse::<u64>().ok())
-    })
 }
 
 async fn export_client_credentials(

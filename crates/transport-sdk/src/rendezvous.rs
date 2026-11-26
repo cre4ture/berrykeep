@@ -3084,7 +3084,7 @@ mod tests {
         const DAY: u64 = 24 * 60 * 60;
         let issued_at = 1_700_000_000;
 
-        // Renewed certificates can be shorter when capped by the original credential expiry.
+        // The age policy also applies when an explicit expiry changes the certificate lifetime.
         for validity_days in [60, 90, 365] {
             let mut params = CertificateParams::new(Vec::new()).unwrap();
             params.not_before = OffsetDateTime::from_unix_timestamp(issued_at as i64).unwrap();
