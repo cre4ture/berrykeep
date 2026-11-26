@@ -1670,12 +1670,18 @@ fn decorate_rendezvous_transport_error(
 }
 
 pub const RENDEZVOUS_IDENTITY_RENEWAL_WINDOW_SECS: u64 = 7 * 24 * 60 * 60;
+pub const RENDEZVOUS_IDENTITY_RENEWAL_AGE_SECS: u64 = 30 * 24 * 60 * 60;
 
+/// Renew after thirty days from issuance, or seven days before expiry, whichever comes first.
 pub fn rendezvous_client_identity_needs_renewal_at(pem: &[u8], now_unix: u64) -> bool {
-    rendezvous_client_identity_not_after_unix(pem)
+    rendezvous_client_identity_validity_unix(pem)
         .ok()
-        .is_some_and(|not_after| {
-            not_after <= now_unix.saturating_add(RENDEZVOUS_IDENTITY_RENEWAL_WINDOW_SECS)
+        .is_some_and(|(not_before, not_after)| {
+            // X.509 timestamps are signed; compare without truncating the caller's u64 clock.
+            let now = i128::from(now_unix);
+            now >= i128::from(not_before) + i128::from(RENDEZVOUS_IDENTITY_RENEWAL_AGE_SECS)
+                || i128::from(not_after)
+                    <= now + i128::from(RENDEZVOUS_IDENTITY_RENEWAL_WINDOW_SECS)
         })
 }
 
@@ -1733,14 +1739,21 @@ fn rendezvous_client_identity_expiry_diagnostic_at(
 }
 
 pub fn rendezvous_client_identity_not_after_unix(client_identity_pem: &[u8]) -> Result<u64> {
-    let certificate_der = rendezvous_client_identity_certificate_der(client_identity_pem)?;
-    let (_, certificate) = parse_x509_certificate(certificate_der.as_ref())
-        .map_err(|error| anyhow!("failed parsing rendezvous client certificate: {error}"))?;
-    let not_after_unix = certificate.validity().not_after.timestamp();
+    let (_, not_after_unix) = rendezvous_client_identity_validity_unix(client_identity_pem)?;
     if not_after_unix < 0 {
         bail!("rendezvous client certificate not_after is before the unix epoch");
     }
     Ok(not_after_unix as u64)
+}
+
+fn rendezvous_client_identity_validity_unix(client_identity_pem: &[u8]) -> Result<(i64, i64)> {
+    let certificate_der = rendezvous_client_identity_certificate_der(client_identity_pem)?;
+    let (_, certificate) = parse_x509_certificate(certificate_der.as_ref())
+        .map_err(|error| anyhow!("failed parsing rendezvous client certificate: {error}"))?;
+    Ok((
+        certificate.validity().not_before.timestamp(),
+        certificate.validity().not_after.timestamp(),
+    ))
 }
 
 fn rendezvous_client_identity_certificate_der(
@@ -3064,6 +3077,36 @@ mod tests {
 
         assert!(message.contains("failed contacting rendezvous endpoint"));
         assert!(message.contains("local rendezvous client identity is expired at"));
+    }
+
+    #[test]
+    fn renewal_check_starts_after_thirty_days_for_long_lived_certificates() {
+        const DAY: u64 = 24 * 60 * 60;
+        let issued_at = 1_700_000_000;
+
+        // Renewed certificates can be shorter when capped by the original credential expiry.
+        for validity_days in [60, 90, 365] {
+            let mut params = CertificateParams::new(Vec::new()).unwrap();
+            params.not_before = OffsetDateTime::from_unix_timestamp(issued_at as i64).unwrap();
+            params.not_after =
+                OffsetDateTime::from_unix_timestamp((issued_at + validity_days * DAY) as i64)
+                    .unwrap();
+            let key = KeyPair::generate().unwrap();
+            let pem = params.self_signed(&key).unwrap().pem();
+
+            assert!(!rendezvous_client_identity_needs_renewal_at(
+                pem.as_bytes(),
+                issued_at,
+            ));
+            assert!(!rendezvous_client_identity_needs_renewal_at(
+                pem.as_bytes(),
+                issued_at + 30 * DAY - 1,
+            ));
+            assert!(rendezvous_client_identity_needs_renewal_at(
+                pem.as_bytes(),
+                issued_at + 30 * DAY,
+            ));
+        }
     }
 
     #[test]

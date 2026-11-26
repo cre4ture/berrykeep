@@ -7873,6 +7873,11 @@ async fn enroll_client_device_issues_relay_identity_when_control_mtls_is_disable
         .expect("rendezvous client identity should include a certificate");
     let (_, parsed) = x509_parser::certificate::X509Certificate::from_der(cert.as_ref())
         .expect("rendezvous client identity certificate DER should parse");
+    let expires_at = parsed.validity().not_after.timestamp();
+    let credential_issued_at = enrolled["created_at_unix"].as_i64().unwrap();
+    assert_eq!(expires_at - credential_issued_at, 90 * 24 * 60 * 60);
+    assert_eq!(enrolled["expires_at_unix"].as_i64(), Some(expires_at));
+
     let mut saw_device_uri = false;
     let mut saw_cluster_uri = false;
     let mut saw_legacy_device_uri = false;
@@ -7945,6 +7950,41 @@ async fn enroll_client_device_fails_closed_when_relay_identity_signer_is_unavail
             "client enrollment issuance is unavailable on this node: relay inner mTLS client identity issuance requires internal_ca_key_pem"
         )
     );
+
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn client_identity_issuance_defaults_to_ninety_days_and_preserves_explicit_expiry() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let (cluster_ca_pem, internal_ca_key_pem) = generate_test_internal_ca();
+    state.network.cluster_ca_pem = Some(cluster_ca_pem);
+    state.network.internal_ca_key_pem = Some(internal_ca_key_pem);
+    state.network.relay_mode = super::RelayMode::Required;
+
+    let explicit_expiry = super::unix_ts() + 10 * 24 * 60 * 60;
+    for expires_at in [None, Some(explicit_expiry)] {
+        let pem = super::issue_client_rendezvous_identity_pem(
+            &state,
+            &Uuid::now_v7().to_string(),
+            expires_at,
+        )
+        .unwrap()
+        .unwrap();
+        let mut reader = std::io::Cursor::new(pem.as_bytes());
+        let cert = CertificateDer::pem_reader_iter(&mut reader)
+            .next()
+            .unwrap()
+            .unwrap();
+        let (_, parsed) =
+            x509_parser::certificate::X509Certificate::from_der(cert.as_ref()).unwrap();
+        let issued_at = parsed.validity().not_before.timestamp();
+        let not_after = parsed.validity().not_after.timestamp();
+        match expires_at {
+            Some(expiry) => assert_eq!(not_after, expiry as i64),
+            None => assert_eq!(not_after - issued_at, 90 * 24 * 60 * 60),
+        }
+    }
 
     cleanup_test_state(&state).await;
 }

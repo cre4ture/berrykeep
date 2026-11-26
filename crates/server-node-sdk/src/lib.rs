@@ -2063,6 +2063,7 @@ impl AdminSessionStore {
 }
 
 const CLIENT_AUTH_MAX_CLOCK_SKEW_SECS: u64 = 300;
+const DEFAULT_CLIENT_IDENTITY_VALIDITY_SECS: u64 = 90 * 24 * 60 * 60;
 const ADMIN_SESSION_TTL_SECS: u64 = 12 * 60 * 60;
 const UPLOAD_SESSION_TTL_SECS: u64 = 24 * 60 * 60;
 
@@ -2379,7 +2380,7 @@ fn issue_client_rendezvous_identity_pem(
     let issued_at_unix = unix_ts();
     let not_after_unix = expires_at_unix
         .filter(|value| *value > issued_at_unix)
-        .unwrap_or_else(|| issued_at_unix + (30 * 24 * 60 * 60));
+        .unwrap_or_else(|| issued_at_unix + DEFAULT_CLIENT_IDENTITY_VALIDITY_SECS);
 
     let mut params =
         CertificateParams::new(Vec::new()).context("failed to initialize client cert params")?;
@@ -27715,7 +27716,7 @@ async fn enroll_client_device_impl(
     }
 
     let now = unix_ts();
-    let credential_expires_at_unix = Some(now + (30 * 24 * 60 * 60));
+    let credential_expires_at_unix = Some(now + DEFAULT_CLIENT_IDENTITY_VALIDITY_SECS);
     let device_id = request
         .device_id
         .map(|value| value.to_string())
