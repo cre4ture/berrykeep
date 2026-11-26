@@ -1212,6 +1212,53 @@ fn concurrent_plan_avoids_route_after_another_request_reports_failure() {
 }
 
 #[test]
+fn failed_preferred_route_is_reprobed_after_its_circuit_expires() {
+    for foreground_use in [false, true] {
+        assert_failed_preferred_route_is_reprobed(foreground_use);
+    }
+}
+
+fn assert_failed_preferred_route_is_reprobed(foreground_use: bool) {
+    let client = BerryKeepClient::combine(vec![
+        BerryKeepClient::from_direct_base_url("http://127.0.0.1:18118/"),
+        BerryKeepClient::from_direct_base_url("http://127.0.0.1:18119/"),
+    ])
+    .expect("routes should combine")
+    .with_route_maintenance_policy(ClientRouteMaintenancePolicy {
+        desired_validated_backups: 0,
+        ..ClientRouteMaintenancePolicy::default()
+    });
+    let primary = client.transport_router.endpoint(0).unwrap();
+    let backup = client.transport_router.endpoint(1).unwrap();
+    {
+        let mut state = lock_endpoint_state(&primary.state);
+        state.record_success(1.0, 0, false);
+        state.last_used_unix_ms = foreground_use.then(unix_ts_ms);
+        state.record_failure("primary unavailable", false);
+        state.circuit = RouteCircuitState::OpenUntil(0);
+    }
+    lock_endpoint_state(&backup.state).record_success(10_000.0, 0, false);
+
+    assert_eq!(client.transport_router.foreground_route_indices()[0], 0);
+    let candidates = client.transport_router.claim_background_probe_candidates();
+    assert_eq!(
+        candidates.len(),
+        1,
+        "an unhealthy preferred route still needs recovery probes"
+    );
+    assert_eq!(candidates[0].route_id, primary.descriptor.route_id);
+    client
+        .transport_router
+        .record_background_probe_candidate_successes(&candidates[0], &[1.0]);
+    assert!(
+        client
+            .transport_router
+            .claim_background_probe_candidates()
+            .is_empty()
+    );
+}
+
+#[test]
 fn availability_target_stops_warming_additional_probation_routes() {
     let client = BerryKeepClient::combine(vec![
         BerryKeepClient::from_direct_base_url("http://127.0.0.1:18120/"),

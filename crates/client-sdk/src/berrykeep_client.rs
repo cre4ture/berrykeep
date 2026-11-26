@@ -1532,8 +1532,11 @@ impl ClientEndpointRouter {
             // At cold start, foreground traffic owns the preferred candidate
             // while background work probes its alternatives. Once real traffic
             // has used any route, a newly discovered preferred route still
-            // needs a probe before it can leave probation.
+            // needs a probe before it can leave probation. A failed preferred route also
+            // needs recovery probes after its circuit expires, even when its old latency
+            // score still ranks ahead of a slower healthy fallback.
             if Some(index) == preferred_index
+                && state.consecutive_failures == 0
                 && (state.validation == RouteValidationState::Validated
                     || !has_foreground_route_use)
             {
