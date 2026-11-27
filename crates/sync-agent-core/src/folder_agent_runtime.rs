@@ -3,7 +3,7 @@ use client_sdk::remote_sync::RemoteSnapshotFetchProgress;
 use client_sdk::{
     BerryKeepClient, ClientConnectionDiagnostics, ClientIdentityMaterial, ConnectionBootstrap,
     ManagedBerryKeepClient, ManagedClientOptions, RemoteSnapshotFetcher, RemoteSnapshotPoller,
-    RemoteSnapshotScope, RemoteSnapshotUpdate,
+    RemoteSnapshotScope,
 };
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::Serialize;
@@ -32,6 +32,12 @@ use crate::{
     startup_dual_modify_conflicts_with_hash, startup_remote_delete_wins_paths_with_hash,
     try_record_modification, upload_local_file,
 };
+
+pub(crate) mod materialization;
+mod remote_observations;
+#[cfg(test)]
+use materialization::apply_remote_snapshot;
+use remote_observations::{RemoteObservation, SnapshotFreshness};
 
 pub type FolderAgentClientIdentityPersistence = fn(&ClientIdentityMaterial) -> Result<()>;
 
@@ -311,6 +317,14 @@ pub trait FolderAgentLocalBackend {
         Ok(())
     }
 
+    fn preserve_local_conflict(
+        &mut self,
+        _options: &FolderAgentRuntimeOptions,
+        _path: &str,
+    ) -> Result<()> {
+        anyhow::bail!("this storage backend does not support preserving a local conflict copy")
+    }
+
     fn scan_local_tree_with_progress(
         &mut self,
         options: &FolderAgentRuntimeOptions,
@@ -378,7 +392,7 @@ enum LocalChangeMonitorState {
 }
 
 enum FolderAgentRuntimeEvent {
-    RemoteUpdate(RemoteSnapshotUpdate),
+    RemoteUpdate(RemoteObservation),
     LocalHint,
     Shutdown,
 }
@@ -423,6 +437,18 @@ impl FolderAgentLocalBackend for NativeFilesystemBackend {
         conflicts: &[crate::StartupConflict],
     ) -> Result<()> {
         materialize_remote_conflict_copies(&options.root_dir, client, scope, conflicts)
+    }
+
+    fn preserve_local_conflict(
+        &mut self,
+        options: &FolderAgentRuntimeOptions,
+        path: &str,
+    ) -> Result<()> {
+        crate::folder_agent_conflicts::preserve_local_conflict_copy(
+            &options.root_dir,
+            path,
+            &absolute_path(&options.root_dir, path),
+        )
     }
 
     fn scan_local_tree_with_progress(
@@ -650,6 +676,8 @@ struct RemoteApplyOutcome {
     ensured_directory_count: usize,
     downloaded_file_count: usize,
     removed_local_path_count: usize,
+    completed_work_count: usize,
+    local_mutation_attempt_count: usize,
 }
 
 impl RemoteApplyOutcome {
@@ -658,6 +686,8 @@ impl RemoteApplyOutcome {
         self.ensured_directory_count += other.ensured_directory_count;
         self.downloaded_file_count += other.downloaded_file_count;
         self.removed_local_path_count += other.removed_local_path_count;
+        self.completed_work_count += other.completed_work_count;
+        self.local_mutation_attempt_count += other.local_mutation_attempt_count;
     }
 }
 
@@ -715,6 +745,7 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
         ),
         None => StartupStateStore::new(&state_identity_root, &scope, &connection_target),
     };
+    let materialization_journal = materialization::open(&state_store)?;
     let modification_log_store = match options.state_root_dir.as_deref() {
         Some(state_root_dir) => ModificationLogStore::new_with_state_root(
             &state_identity_root,
@@ -992,7 +1023,12 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
     let mut local_state = local_state_before_remote_sync;
     let mut remote_index = RemoteTreeIndex::default();
     let mut suppressed_uploads: BTreeMap<String, LocalEntryState> = BTreeMap::new();
-    let mut initial_remote_outcome = apply_remote_snapshot(
+    // Capture only choices still awaiting execution at this startup. They may
+    // finish during the initial drain, but completed history from an earlier
+    // startup must never suppress a newly detected conflict at the same path.
+    let explicit_resolutions = materialization::resolution_paths(&materialization_journal)?;
+    let mut initial_remote_outcome = materialization::apply_remote_snapshot_with_journal(
+        &materialization_journal,
         backend,
         options,
         &client,
@@ -1071,6 +1107,7 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
     let startup_local_sync_message =
         format!("Scanning {local_tree_label} and reconciling startup local changes");
 
+    let blocked_startup_paths = materialization::blocked_local_paths(&materialization_journal)?;
     let initial_local_sync_outcome = run_with_status_heartbeat(
         status_callback.clone(),
         BlockingStatusProgress {
@@ -1110,6 +1147,7 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
                     base_message: startup_local_sync_message.clone(),
                     last_success_unix_ms,
                 }),
+                Some(&blocked_startup_paths),
             )
         },
     )?;
@@ -1117,9 +1155,11 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
     state_store
         .persist_local_baseline(&local_state)
         .context("failed to persist sqlite baseline after startup reconciliation")?;
+    startup_conflicts.retain(|conflict| !explicit_resolutions.contains(&conflict.path));
     state_store
         .persist_startup_conflicts(&startup_conflicts)
         .context("failed to persist startup conflicts")?;
+    materialization::publish_conflicts(&materialization_journal, &state_store)?;
 
     last_success_unix_ms = Some(now_unix_ms());
     let mut initial_runtime_metrics =
@@ -1141,11 +1181,14 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
     );
     initial_runtime_metrics.preserved_local_file_count = usize_to_u64(preserve_local_files.len());
     initial_runtime_metrics.startup_conflict_count = usize_to_u64(startup_conflicts.len());
-    let initial_sync_message = format!(
-        "Initial sync complete: {} and {}",
-        format_remote_apply_summary(initial_remote_outcome),
-        format_local_sync_summary(initial_local_sync_outcome)
-    );
+    let initial_sync_message = materialization::status_message(
+        &materialization_journal,
+        format!(
+            "Initial sync complete: {} and {}",
+            format_remote_apply_summary(initial_remote_outcome),
+            format_local_sync_summary(initial_local_sync_outcome)
+        ),
+    )?;
 
     if options.run_once {
         emit_status(
@@ -1207,38 +1250,48 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
     let remote_watch_mode = watch_mode.to_string();
     let remote_latest_metrics = latest_metrics.clone();
     let remote_last_success = last_success_shared.clone();
-    let remote_idle_message = idle_watch_message.clone();
+    let remote_idle_message = "Watching for remote changes".to_owned();
     let remote_event_tx = runtime_event_tx.clone();
-    let remote_thread = refresh_poller.spawn_fetcher_loop_with_fetch(
-        remote_running,
-        Some(initial_snapshot),
-        refresh_fetcher,
-        move |refresh_fetcher| {
-            fetch_remote_snapshot_with_status_progress(
-                &remote_options,
-                &remote_connection_target,
-                &remote_storage_mode,
-                &remote_watch_mode,
-                remote_status_callback.as_ref(),
-                "running",
-                "steady-state",
-                "checking-remote-snapshot",
-                "Checking remote snapshot for changes",
-                refresh_fetcher,
-                latest_metrics_value(&remote_latest_metrics),
-                load_optional_unix_ms(&remote_last_success),
-                Some(remote_idle_message.as_str()),
-            )
-        },
-        move |update| {
-            if remote_event_tx
-                .send(FolderAgentRuntimeEvent::RemoteUpdate(update))
-                .is_err()
-            {
-                remote_stop_signal.store(false, Ordering::SeqCst);
-            }
-        },
-    );
+    let snapshot_freshness = SnapshotFreshness::default();
+    let fetch_freshness = snapshot_freshness.clone();
+    let delivery_freshness = snapshot_freshness.clone();
+    let refresh_freshness = snapshot_freshness.clone();
+
+    let remote_thread = refresh_poller
+        .spawn_fetcher_loop_with_fetch_and_unchanged_snapshot_refresh(
+            remote_running,
+            Some(initial_snapshot),
+            refresh_fetcher,
+            move |refresh_fetcher| {
+                fetch_freshness.begin_fetch();
+                fetch_remote_snapshot_with_status_progress(
+                    &remote_options,
+                    &remote_connection_target,
+                    &remote_storage_mode,
+                    &remote_watch_mode,
+                    remote_status_callback.as_ref(),
+                    "running",
+                    "steady-state",
+                    "checking-remote-snapshot",
+                    "Checking remote snapshot for changes",
+                    refresh_fetcher,
+                    latest_metrics_value(&remote_latest_metrics),
+                    load_optional_unix_ms(&remote_last_success),
+                    Some(remote_idle_message.as_str()),
+                )
+            },
+            move |update| {
+                if remote_event_tx
+                    .send(FolderAgentRuntimeEvent::RemoteUpdate(
+                        delivery_freshness.tag(update),
+                    ))
+                    .is_err()
+                {
+                    remote_stop_signal.store(false, Ordering::SeqCst);
+                }
+            },
+            move || refresh_freshness.needs_refresh(),
+        );
 
     let local_change_wake: FolderAgentWakeCallback = Arc::new({
         let runtime_event_tx = runtime_event_tx.clone();
@@ -1252,6 +1305,8 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
         + steady_state_local_scan_interval(options, backend.local_watch_hints_available(options));
     let mut pending_local_scan_hint = false;
     let mut pending_remote_updates = Vec::new();
+    let mut deferred_remote_paths = BTreeSet::new();
+    let mut next_materialization_retry = materialization::next_deadline(&materialization_journal)?;
 
     while running.load(Ordering::SeqCst) {
         if !drain_runtime_events(
@@ -1264,8 +1319,12 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
 
         let mut baseline_dirty = false;
         let mut remote_updates_applied = false;
+        let mut remote_plan_changed = false;
         let mut combined_remote_outcome = RemoteApplyOutcome::default();
         for update in std::mem::take(&mut pending_remote_updates) {
+            let Some(update) = snapshot_freshness.accept(update, &mut deferred_remote_paths) else {
+                continue;
+            };
             let mut remote_pending_metrics =
                 FolderAgentRuntimeMetrics::from_states(Some(&local_state), Some(&remote_index));
             remote_pending_metrics.changed_path_count = usize_to_u64(update.changed_paths.len());
@@ -1283,7 +1342,8 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
                 last_success_unix_ms,
                 None,
             );
-            combined_remote_outcome.accumulate(apply_remote_snapshot(
+            let progress = materialization::apply_remote_snapshot_with_journal(
+                &materialization_journal,
                 backend,
                 options,
                 &client,
@@ -1298,8 +1358,40 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
                 &mut remote_index,
                 Some(&modification_log_store),
                 Some(&remote_refresh_log_context),
-            )?);
-            remote_updates_applied = true;
+            )?;
+            remote_updates_applied |= progress.completed_work_count > 0;
+            if progress.local_mutation_attempt_count > 0 {
+                snapshot_freshness.local_mutations_committed();
+            }
+            remote_plan_changed = true;
+            combined_remote_outcome.accumulate(progress);
+        }
+
+        if next_materialization_retry.is_some_and(|deadline| Instant::now() >= deadline) {
+            let progress = materialization::drain_remote_work(
+                &materialization_journal,
+                backend,
+                options,
+                &client,
+                Some(&mut local_state),
+                Some(&state_store),
+                &scope,
+                &mut suppressed_uploads,
+                &mut remote_index,
+                Some(&modification_log_store),
+                Some(&remote_refresh_log_context),
+            )?;
+            remote_updates_applied |= progress.completed_work_count > 0;
+            if progress.local_mutation_attempt_count > 0 {
+                snapshot_freshness.local_mutations_committed();
+            }
+            combined_remote_outcome.accumulate(progress);
+        }
+        if remote_plan_changed
+            || remote_updates_applied
+            || next_materialization_retry.is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            next_materialization_retry = materialization::next_deadline(&materialization_journal)?;
         }
 
         if remote_updates_applied {
@@ -1309,7 +1401,7 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
                 &suppressed_uploads,
                 None,
             );
-            baseline_dirty = true;
+            // Remote handlers persist successful path baselines incrementally.
             let local_scan_deadline = Instant::now()
                 + steady_state_local_scan_interval(
                     options,
@@ -1339,10 +1431,13 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
                 "running",
                 "steady-state",
                 "watching-for-changes",
-                format!(
-                    "Applied remote changes: {}",
-                    format_remote_apply_summary(combined_remote_outcome)
-                ),
+                materialization::status_message(
+                    &materialization_journal,
+                    format!(
+                        "Applied remote changes: {}",
+                        format_remote_apply_summary(combined_remote_outcome)
+                    ),
+                )?,
                 remote_runtime_metrics.clone(),
                 last_success_unix_ms,
                 None,
@@ -1395,6 +1490,7 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
                 last_success_unix_ms,
                 None,
             );
+            let blocked_paths = materialization::blocked_local_paths(&materialization_journal)?;
             let local_sync_outcome = run_with_status_heartbeat(
                 status_callback.clone(),
                 BlockingStatusProgress {
@@ -1438,9 +1534,19 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
                             base_message: local_scan_base_message.clone(),
                             last_success_unix_ms,
                         }),
+                        Some(&blocked_paths),
                     )
                 },
-            )?;
+            );
+            // Errors may follow a successful RPC in a multi-step local pass.
+            if local_sync_outcome.as_ref().is_err()
+                || local_sync_outcome
+                    .as_ref()
+                    .is_ok_and(|outcome| !outcome.is_empty())
+            {
+                snapshot_freshness.local_mutations_committed();
+            }
+            let local_sync_outcome = local_sync_outcome?;
             if local_sync_outcome.changed_path_count > 0 {
                 baseline_dirty = true;
             }
@@ -1470,7 +1576,10 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
                 "steady-state",
                 "watching-for-changes",
                 if local_sync_outcome.is_empty() {
-                    idle_watch_message.clone()
+                    materialization::status_message(
+                        &materialization_journal,
+                        idle_watch_message.clone(),
+                    )?
                 } else {
                     backend.watch_after_local_sync_message(
                         options,
@@ -1494,7 +1603,8 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
             && !wait_for_runtime_event(
                 &runtime_event_rx,
                 running.as_ref(),
-                next_local_scan,
+                next_materialization_retry
+                    .map_or(next_local_scan, |deadline| next_local_scan.min(deadline)),
                 &mut pending_remote_updates,
                 &mut pending_local_scan_hint,
             )
@@ -2058,8 +2168,9 @@ fn sync_local_changes<B: FolderAgentLocalBackend>(
     modification_context: Option<&ModificationLogContext>,
     status_callback: Option<&FolderAgentStatusCallback>,
     local_scan_status: Option<&LocalScanStatusContext>,
+    blocked_paths: Option<&BTreeSet<String>>,
 ) -> Result<LocalSyncOutcome> {
-    let current = match local_scan_status {
+    let mut current = match local_scan_status {
         Some(progress) => scan_local_tree_with_status_progress(
             backend,
             &progress.options,
@@ -2076,6 +2187,25 @@ fn sync_local_changes<B: FolderAgentLocalBackend>(
             scan_local_tree_without_status(backend, options).context("failed to scan local root")?
         }
     };
+    if let Some(blocked) = blocked_paths {
+        let related = |path: &str| {
+            blocked.contains(path)
+                || parent_directories(path)
+                    .iter()
+                    .any(|parent| blocked.contains(parent))
+                || blocked
+                    .range(format!("{path}/")..)
+                    .next()
+                    .is_some_and(|candidate| candidate.starts_with(&format!("{path}/")))
+        };
+        current.retain(|path, _| !related(path));
+        current.extend(
+            local_state
+                .iter()
+                .filter(|(path, _)| related(path))
+                .map(|(path, state)| (path.clone(), state.clone())),
+        );
+    }
     let diff = diff_local_trees(local_state, &current);
     let mut outcome = LocalSyncOutcome {
         changed_path_count: diff.created_directories.len()
@@ -2318,7 +2448,7 @@ fn remote_index_contains_path_or_descendants(remote_index: &RemoteTreeIndex, pat
 }
 
 #[allow(clippy::too_many_arguments)]
-fn apply_remote_snapshot<B: FolderAgentLocalBackend>(
+fn apply_remote_snapshot_entry<B: FolderAgentLocalBackend>(
     backend: &mut B,
     options: &FolderAgentRuntimeOptions,
     client: &BerryKeepClient,
@@ -2704,7 +2834,7 @@ fn local_scan_trigger(
 
 fn enqueue_runtime_event(
     event: FolderAgentRuntimeEvent,
-    pending_remote_updates: &mut Vec<RemoteSnapshotUpdate>,
+    pending_remote_updates: &mut Vec<RemoteObservation>,
     pending_local_scan_hint: &mut bool,
 ) -> bool {
     match event {
@@ -2717,7 +2847,7 @@ fn enqueue_runtime_event(
 
 fn drain_runtime_events(
     runtime_event_rx: &mpsc::Receiver<FolderAgentRuntimeEvent>,
-    pending_remote_updates: &mut Vec<RemoteSnapshotUpdate>,
+    pending_remote_updates: &mut Vec<RemoteObservation>,
     pending_local_scan_hint: &mut bool,
 ) -> bool {
     while let Ok(event) = runtime_event_rx.try_recv() {
@@ -2738,7 +2868,7 @@ fn wait_for_runtime_event(
     runtime_event_rx: &mpsc::Receiver<FolderAgentRuntimeEvent>,
     running: &AtomicBool,
     next_local_scan: Instant,
-    pending_remote_updates: &mut Vec<RemoteSnapshotUpdate>,
+    pending_remote_updates: &mut Vec<RemoteObservation>,
     pending_local_scan_hint: &mut bool,
 ) -> bool {
     if !running.load(Ordering::SeqCst) {
@@ -3265,6 +3395,7 @@ fn local_entry_state_from_metadata(metadata: &fs::Metadata) -> LocalEntryState {
 
 #[cfg(test)]
 mod tests {
+    use super::materialization::{apply_remote_snapshot_with_journal, folder_materialization_plan};
     use super::*;
     use anyhow::{Result, bail};
     use std::collections::{BTreeMap, BTreeSet};
@@ -3278,6 +3409,8 @@ mod tests {
             remote_key: String,
         },
         RemoveLocalPath(String),
+        UploadFile(String),
+        PreserveLocalPath(String),
     }
 
     #[derive(Debug, Default)]
@@ -3285,6 +3418,11 @@ mod tests {
         local_entries: LocalTreeState,
         operations: Vec<BackendOperation>,
         fail_download_for: Option<String>,
+        fail_remove: bool,
+        fingerprints: BTreeMap<String, String>,
+        scan_count: usize,
+        allow_upload: bool,
+        backups: LocalTreeState,
     }
 
     impl RecordingBackend {
@@ -3313,11 +3451,30 @@ mod tests {
             Ok(())
         }
 
+        fn preserve_local_conflict(
+            &mut self,
+            _options: &FolderAgentRuntimeOptions,
+            path: &str,
+        ) -> Result<()> {
+            self.operations
+                .push(BackendOperation::PreserveLocalPath(path.to_owned()));
+            let prefix = format!("{path}/");
+            self.backups.extend(
+                self.local_entries
+                    .iter()
+                    .filter(|(candidate, _)| *candidate == path || candidate.starts_with(&prefix))
+                    .map(|(path, state)| (path.clone(), state.clone())),
+            );
+            remove_local_state_path_and_descendants(&mut self.local_entries, path);
+            Ok(())
+        }
+
         fn scan_local_tree_with_progress(
             &mut self,
             _options: &FolderAgentRuntimeOptions,
             _on_progress: &mut dyn FnMut(&LocalTreeScanProgress),
         ) -> Result<LocalTreeState> {
+            self.scan_count += 1;
             Ok(self.local_entries.clone())
         }
 
@@ -3334,7 +3491,11 @@ mod tests {
             _options: &FolderAgentRuntimeOptions,
             relative_path: &str,
         ) -> Result<String> {
-            Ok(format!("fingerprint-{relative_path}"))
+            Ok(self
+                .fingerprints
+                .get(relative_path)
+                .cloned()
+                .unwrap_or_else(|| format!("fingerprint-{relative_path}")))
         }
 
         fn ensure_local_directory(
@@ -3367,13 +3528,16 @@ mod tests {
 
         fn upload_local_file(
             &mut self,
-            _options: &FolderAgentRuntimeOptions,
+            options: &FolderAgentRuntimeOptions,
             _client: &BerryKeepClient,
             _scope: &PathScope,
-            _relative_path: &str,
+            relative_path: &str,
             _size_bytes: u64,
         ) -> Result<String> {
-            panic!("upload_local_file should not be called in this test");
+            assert!(self.allow_upload, "unexpected upload in this test");
+            self.operations
+                .push(BackendOperation::UploadFile(relative_path.to_owned()));
+            self.file_content_fingerprint(options, relative_path)
         }
 
         fn download_remote_file(
@@ -3390,6 +3554,7 @@ mod tests {
             if self.fail_download_for.as_deref() == Some(local_relative_path) {
                 bail!("simulated download failure");
             }
+            self.fingerprints.remove(local_relative_path);
             remove_local_state_path_and_descendants(&mut self.local_entries, local_relative_path);
             for parent in parent_directories(local_relative_path) {
                 self.local_entries.insert(
@@ -3417,6 +3582,9 @@ mod tests {
             _options: &FolderAgentRuntimeOptions,
             relative_path: &str,
         ) -> Result<()> {
+            if self.fail_remove {
+                bail!("simulated remove failure");
+            }
             self.operations
                 .push(BackendOperation::RemoveLocalPath(relative_path.to_string()));
             remove_local_state_path_and_descendants(&mut self.local_entries, relative_path);
@@ -3706,6 +3874,61 @@ mod tests {
     }
 
     #[test]
+    fn remote_materialization_resumes_pending_work_without_changed_paths() {
+        let root = crate::test_support::test_root();
+        let journal = crate::sync_work::WorkStore::open(root.join("sync-work.sqlite")).unwrap();
+        let snapshot = SyncSnapshot {
+            local: Vec::new(),
+            remote: vec![sync_core::NamespaceEntry::file("a.txt", "v1", "h1")],
+        };
+        let scope = PathScope::new(None);
+        let mut backend = RecordingBackend::default();
+        let mut options = test_runtime_options();
+        options.run_once = false;
+        let client = BerryKeepClient::from_direct_base_url("http://127.0.0.1:1");
+        let work = folder_materialization_plan(
+            &snapshot,
+            &scope,
+            Some(&["a.txt".into()]),
+            &RemoteTreeIndex::default(),
+            &[],
+        )
+        .unwrap();
+        journal.reconcile("folder-materialization", &work).unwrap();
+        let lease = journal
+            .claim_next("folder-materialization", 0, 10)
+            .unwrap()
+            .unwrap();
+        // Model an interrupted process. No changed-path notification is sent after recovery.
+        assert_eq!(lease.work.resource, "a.txt");
+        let mut index = RemoteTreeIndex::default();
+        let mut suppressed = BTreeMap::new();
+        apply_remote_snapshot_with_journal(
+            &journal,
+            &mut backend,
+            &options,
+            &client,
+            &snapshot,
+            None,
+            Some(&[]),
+            None,
+            None,
+            None,
+            &scope,
+            &mut suppressed,
+            &mut index,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(backend.local_entries.contains_key("a.txt"));
+        assert_eq!(
+            journal.status("folder-materialization").unwrap().completed,
+            1
+        );
+    }
+
+    #[test]
     fn apply_remote_snapshot_skips_stale_remote_delete_for_locally_recreated_path() {
         let mut backend = RecordingBackend::default();
         backend.local_entries.insert(
@@ -3763,6 +3986,1517 @@ mod tests {
             BTreeSet::from(["empty-lifecycle".to_string()])
         );
         assert!(remote_index.files.is_empty());
+    }
+
+    #[test]
+    fn remote_delete_requires_prior_remote_or_synced_baseline_evidence() {
+        for (synced_before, locally_changed) in [(false, false), (true, false), (true, true)] {
+            let root = crate::test_support::test_root();
+            let scope = PathScope::new(None);
+            let state = StartupStateStore::new_with_state_root(
+                &root,
+                &scope,
+                "http://127.0.0.1:1",
+                &root.join("state"),
+            );
+            let original = LocalEntryState {
+                kind: LocalEntryKind::File,
+                size_bytes: 16,
+                modified_unix_ms: 1,
+            };
+            if synced_before {
+                state
+                    .upsert_baseline_entry_with_hash("item", &original, Some("synced"))
+                    .unwrap();
+            }
+            let mut backend = RecordingBackend::default();
+            backend.local_entries.insert(
+                "item".into(),
+                LocalEntryState {
+                    modified_unix_ms: if locally_changed { 2 } else { 1 },
+                    ..original
+                },
+            );
+            backend.fingerprints.insert(
+                "item".into(),
+                if locally_changed { "edited" } else { "synced" }.into(),
+            );
+            let journal = crate::sync_work::WorkStore::open(root.join("work.sqlite")).unwrap();
+            let mut options = test_runtime_options();
+            options.run_once = false;
+            apply_remote_snapshot_with_journal(
+                &journal,
+                &mut backend,
+                &options,
+                &BerryKeepClient::from_direct_base_url("http://127.0.0.1:1"),
+                &SyncSnapshot::default(),
+                None,
+                Some(&["item".into()]),
+                None,
+                None,
+                Some(&state),
+                &scope,
+                &mut BTreeMap::new(),
+                &mut RemoteTreeIndex::default(),
+                None,
+                None,
+            )
+            .unwrap();
+            let conflict = synced_before && locally_changed;
+            let removed = synced_before && !locally_changed;
+            assert_eq!(
+                journal.status("folder-materialization").unwrap().conflicts,
+                u64::from(conflict)
+            );
+            assert_eq!(backend.local_entries.contains_key("item"), !removed);
+            assert_eq!(backend.operations.len(), usize::from(removed));
+            assert_eq!(
+                materialization::blocked_local_paths(&journal)
+                    .unwrap()
+                    .is_empty(),
+                !conflict
+            );
+        }
+    }
+
+    #[test]
+    fn delayed_startup_work_preserves_offline_and_new_local_files() {
+        let root = crate::test_support::test_root();
+        let journal = crate::sync_work::WorkStore::open(root.join("work.sqlite")).unwrap();
+        let mut snapshot = SyncSnapshot::default();
+        for index in 0..64 {
+            snapshot.remote.push(sync_core::NamespaceEntry::file(
+                format!("a{index:03}"),
+                "r1",
+                "remote",
+            ));
+        }
+        snapshot
+            .remote
+            .push(sync_core::NamespaceEntry::file("z-offline", "r1", "remote"));
+        snapshot
+            .remote
+            .push(sync_core::NamespaceEntry::file("z-user", "r1", "remote"));
+        let local_file = LocalEntryState {
+            kind: LocalEntryKind::File,
+            size_bytes: 7,
+            modified_unix_ms: 99,
+        };
+        let mut backend = RecordingBackend::default();
+        backend
+            .local_entries
+            .insert("z-offline".into(), local_file.clone());
+        let mut options = test_runtime_options();
+        options.run_once = false;
+        let client = BerryKeepClient::from_direct_base_url("http://127.0.0.1:1");
+        let scope = PathScope::new(None);
+        let preserve = BTreeSet::from(["z-offline".into()]);
+        let mut suppressed = BTreeMap::new();
+        let mut index = RemoteTreeIndex::default();
+        apply_remote_snapshot_with_journal(
+            &journal,
+            &mut backend,
+            &options,
+            &client,
+            &snapshot,
+            None,
+            None,
+            Some(&preserve),
+            None,
+            None,
+            &scope,
+            &mut suppressed,
+            &mut index,
+            None,
+            None,
+        )
+        .unwrap();
+        backend
+            .local_entries
+            .insert("z-user".into(), local_file.clone());
+        apply_remote_snapshot_with_journal(
+            &journal,
+            &mut backend,
+            &options,
+            &client,
+            &snapshot,
+            None,
+            Some(&[]),
+            None,
+            None,
+            None,
+            &scope,
+            &mut suppressed,
+            &mut index,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(backend.local_entries.get("z-offline"), Some(&local_file));
+        assert_eq!(backend.local_entries.get("z-user"), Some(&local_file));
+        assert!(!backend.operations.iter().any(|op|matches!(op,BackendOperation::DownloadFile{local_path,..} if local_path.starts_with("z-"))));
+        assert_eq!(
+            journal.status("folder-materialization").unwrap().conflicts,
+            1
+        );
+    }
+
+    #[test]
+    fn queued_delete_retries_original_but_preserves_recreated_file() {
+        for replaced in [false, true] {
+            let root = crate::test_support::test_root();
+            let journal = crate::sync_work::WorkStore::open(root.join("work.sqlite")).unwrap();
+            let mut backend = RecordingBackend {
+                fail_remove: true,
+                ..RecordingBackend::default()
+            };
+            backend.local_entries.insert(
+                "a.txt".into(),
+                LocalEntryState {
+                    kind: LocalEntryKind::File,
+                    size_bytes: 7,
+                    modified_unix_ms: 1,
+                },
+            );
+            let mut options = test_runtime_options();
+            options.run_once = false;
+            let client = BerryKeepClient::from_direct_base_url("http://127.0.0.1:1");
+            let snapshot = SyncSnapshot::default();
+            let scope = PathScope::new(None);
+            let mut index = RemoteTreeIndex::default();
+            index.files.insert("a.txt".into());
+            let mut suppressed = BTreeMap::new();
+            apply_remote_snapshot_with_journal(
+                &journal,
+                &mut backend,
+                &options,
+                &client,
+                &snapshot,
+                None,
+                Some(&["a.txt".into()]),
+                None,
+                None,
+                None,
+                &scope,
+                &mut suppressed,
+                &mut index,
+                None,
+                None,
+            )
+            .unwrap();
+            assert!(index.files.is_empty());
+            let retry = journal
+                .claim_next(
+                    "folder-materialization",
+                    crate::sync_work::now_ms() + 10_000,
+                    120_000,
+                )
+                .unwrap()
+                .unwrap();
+            journal
+                .finish(
+                    &retry,
+                    crate::sync_work::WorkResult::Retry("ready".into()),
+                    0,
+                )
+                .unwrap();
+            backend.fail_remove = false;
+            if replaced {
+                backend
+                    .local_entries
+                    .get_mut("a.txt")
+                    .unwrap()
+                    .modified_unix_ms = 2;
+            }
+            apply_remote_snapshot_with_journal(
+                &journal,
+                &mut backend,
+                &options,
+                &client,
+                &snapshot,
+                None,
+                Some(&[]),
+                None,
+                None,
+                None,
+                &scope,
+                &mut suppressed,
+                &mut index,
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(backend.local_entries.contains_key("a.txt"), replaced);
+            assert_eq!(
+                journal.status("folder-materialization").unwrap().conflicts,
+                u64::from(replaced)
+            );
+        }
+    }
+
+    #[test]
+    fn queued_destructive_work_checks_contents_even_when_metadata_is_unchanged() {
+        for directory in [false, true] {
+            let root = crate::test_support::test_root();
+            let journal = crate::sync_work::WorkStore::open(root.join("work.sqlite")).unwrap();
+            let mut backend = RecordingBackend {
+                fail_remove: true,
+                ..RecordingBackend::default()
+            };
+            let file = LocalEntryState {
+                kind: LocalEntryKind::File,
+                size_bytes: 7,
+                modified_unix_ms: 1,
+            };
+            let (path, content_path) = if directory {
+                ("docs", "docs/a.txt")
+            } else {
+                ("a.txt", "a.txt")
+            };
+            backend.local_entries.insert(
+                path.into(),
+                if directory {
+                    LocalEntryState {
+                        kind: LocalEntryKind::Directory,
+                        size_bytes: 0,
+                        modified_unix_ms: 1,
+                    }
+                } else {
+                    file.clone()
+                },
+            );
+            backend.local_entries.insert(content_path.into(), file);
+            let mut options = test_runtime_options();
+            options.run_once = false;
+            let client = BerryKeepClient::from_direct_base_url("http://127.0.0.1:1");
+            let snapshot = SyncSnapshot::default();
+            let scope = PathScope::new(None);
+            let mut index = RemoteTreeIndex::default();
+            if directory {
+                index.directories.insert(path.into());
+            } else {
+                index.files.insert(path.into());
+            }
+            let mut suppressed = BTreeMap::new();
+            apply_remote_snapshot_with_journal(
+                &journal,
+                &mut backend,
+                &options,
+                &client,
+                &snapshot,
+                None,
+                Some(&[path.into()]),
+                None,
+                None,
+                None,
+                &scope,
+                &mut suppressed,
+                &mut index,
+                None,
+                None,
+            )
+            .unwrap();
+            let retry = journal
+                .claim_next(
+                    "folder-materialization",
+                    crate::sync_work::now_ms() + 10_000,
+                    120_000,
+                )
+                .unwrap()
+                .unwrap();
+            journal
+                .finish(
+                    &retry,
+                    crate::sync_work::WorkResult::Retry("ready".into()),
+                    0,
+                )
+                .unwrap();
+            backend.fail_remove = false;
+            backend
+                .fingerprints
+                .insert(content_path.into(), "edited-same-size-and-mtime".into());
+            apply_remote_snapshot_with_journal(
+                &journal,
+                &mut backend,
+                &options,
+                &client,
+                &snapshot,
+                None,
+                Some(&[]),
+                None,
+                None,
+                None,
+                &scope,
+                &mut suppressed,
+                &mut index,
+                None,
+                None,
+            )
+            .unwrap();
+            assert!(backend.local_entries.contains_key(content_path));
+            assert_eq!(
+                journal.status("folder-materialization").unwrap().conflicts,
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn unchanged_remote_echo_does_not_block_local_kind_changes_or_recreate_old_children() {
+        for remote_child_changed in [false, true] {
+            let root = crate::test_support::test_root();
+            let state = StartupStateStore::new_with_state_root(
+                &root,
+                &PathScope::new(None),
+                "http://127.0.0.1:1",
+                &root.join("state"),
+            );
+            let journal = crate::sync_work::WorkStore::open(root.join("work.sqlite")).unwrap();
+            let file = LocalEntryState {
+                kind: LocalEntryKind::File,
+                size_bytes: 7,
+                modified_unix_ms: 1,
+            };
+            let directory = LocalEntryState {
+                kind: LocalEntryKind::Directory,
+                size_bytes: 0,
+                modified_unix_ms: 1,
+            };
+            state
+                .upsert_baseline_entry_with_hash("file-to-dir", &file, Some("synced-file"))
+                .unwrap();
+            state
+                .upsert_baseline_entry("dir-to-file", &directory)
+                .unwrap();
+            state
+                .upsert_baseline_entry("deleted-empty", &directory)
+                .unwrap();
+            state
+                .upsert_baseline_entry_with_hash("dir-to-file/old", &file, Some("synced-child"))
+                .unwrap();
+            let baseline = state.load_local_baseline().unwrap();
+            let mut local_state = baseline.clone();
+            let mut backend = RecordingBackend::default();
+            backend
+                .local_entries
+                .insert("file-to-dir".into(), directory);
+            backend
+                .local_entries
+                .insert("file-to-dir/new".into(), file.clone());
+            backend.local_entries.insert("dir-to-file".into(), file);
+            let before = backend.local_entries.clone();
+            let snapshot = SyncSnapshot {
+                local: vec![],
+                remote: vec![
+                    sync_core::NamespaceEntry::file("file-to-dir", "r1", "synced-file"),
+                    sync_core::NamespaceEntry::directory("dir-to-file"),
+                    sync_core::NamespaceEntry::directory("deleted-empty"),
+                    sync_core::NamespaceEntry::file(
+                        "dir-to-file/old",
+                        "r1",
+                        if remote_child_changed {
+                            "changed-remote-child"
+                        } else {
+                            "synced-child"
+                        },
+                    ),
+                ],
+            };
+            let mut index = RemoteTreeIndex::default();
+            index
+                .files
+                .extend(["file-to-dir".into(), "dir-to-file/old".into()]);
+            index.directories.insert("dir-to-file".into());
+            index.directories.insert("deleted-empty".into());
+            let mut options = test_runtime_options();
+            options.run_once = false;
+            let changed = vec![
+                "file-to-dir".into(),
+                "dir-to-file".into(),
+                "dir-to-file/old".into(),
+                "deleted-empty".into(),
+            ];
+            apply_remote_snapshot_with_journal(
+                &journal,
+                &mut backend,
+                &options,
+                &BerryKeepClient::from_direct_base_url("http://127.0.0.1:1"),
+                &snapshot,
+                Some(&mut local_state),
+                Some(&changed),
+                None,
+                None,
+                Some(&state),
+                &PathScope::new(None),
+                &mut BTreeMap::new(),
+                &mut index,
+                None,
+                None,
+            )
+            .unwrap();
+            assert!(
+                backend.operations.is_empty(),
+                "stale echo must not touch local paths: {:?}",
+                backend.operations
+            );
+            assert_eq!(backend.local_entries, before);
+            assert_eq!(
+                state.load_local_baseline().unwrap(),
+                baseline,
+                "local scan still needs the old baseline to propagate the user's changes"
+            );
+            assert_eq!(
+                journal.status("folder-materialization").unwrap().conflicts,
+                u64::from(remote_child_changed)
+            );
+            let blocked = materialization::blocked_local_paths(&journal).unwrap();
+            assert_eq!(blocked.is_empty(), !remote_child_changed);
+        }
+    }
+
+    fn hold_materialization_resource(
+        journal: &crate::sync_work::WorkStore,
+        path: &str,
+    ) -> crate::sync_work::WorkLease {
+        journal
+            .enqueue(
+                "blocker",
+                &[crate::sync_work::PlannedWork::new(
+                    "active",
+                    path,
+                    serde_json::json!({}),
+                )],
+            )
+            .unwrap();
+        journal
+            .claim_next("blocker", crate::sync_work::now_ms(), 120_000)
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn metadata_enrichment_cannot_rearm_an_old_revision_after_a_local_kind_replacement() {
+        for (change, has_revision) in [
+            ("metadata", true),
+            ("metadata", false),
+            ("revision", true),
+            ("revision", false),
+            ("identity", true),
+            ("identity", false),
+            ("content", false),
+        ] {
+            let root = crate::test_support::test_root();
+            let scope = PathScope::new(None);
+            let state = StartupStateStore::new_with_state_root(
+                &root,
+                &scope,
+                "http://127.0.0.1:1",
+                &root.join("state"),
+            );
+            let original = LocalEntryState {
+                kind: LocalEntryKind::File,
+                size_bytes: 7,
+                modified_unix_ms: 1,
+            };
+            state
+                .upsert_baseline_entry_with_hash("item", &original, Some("synced"))
+                .unwrap();
+            let mut backend = RecordingBackend::default();
+            backend.local_entries.insert("item".into(), original);
+            backend.fingerprints.insert("item".into(), "synced".into());
+            let journal = crate::sync_work::WorkStore::open(root.join("work.sqlite")).unwrap();
+            let mut remote = sync_core::NamespaceEntry::file("item", "r1", "synced");
+            remote.object_id = Some("original-object".into());
+            remote.version = has_revision.then(|| "r1".into());
+            let mut snapshot = SyncSnapshot {
+                local: vec![],
+                remote: vec![remote],
+            };
+            let mut options = test_runtime_options();
+            options.run_once = false;
+            let client = BerryKeepClient::from_direct_base_url("http://127.0.0.1:1");
+            let mut index = RemoteTreeIndex::default();
+            let mut suppressed = BTreeMap::new();
+            apply_remote_snapshot_with_journal(
+                &journal,
+                &mut backend,
+                &options,
+                &client,
+                &snapshot,
+                None,
+                None,
+                None,
+                None,
+                Some(&state),
+                &scope,
+                &mut suppressed,
+                &mut index,
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                journal.status("folder-materialization").unwrap().completed,
+                1
+            );
+            let replacement = LocalEntryState {
+                kind: LocalEntryKind::Directory,
+                size_bytes: 0,
+                modified_unix_ms: 2,
+            };
+            backend
+                .local_entries
+                .insert("item".into(), replacement.clone());
+            state.upsert_baseline_entry("item", &replacement).unwrap();
+            index.files.remove("item");
+            index.directories.insert("item".into());
+            let remote = &mut snapshot.remote[0];
+            remote.modified_at_unix = Some(123);
+            remote.content_fingerprint = Some("synced".into());
+            remote.media = Some(sync_core::NamespaceMediaMetadata {
+                mime_type: Some("text/plain".into()),
+                ..Default::default()
+            });
+            if change == "revision" {
+                remote.version = Some("r2".into());
+            }
+            if change == "identity" {
+                remote.object_id = Some("replacement-object".into());
+            }
+            if change == "content" {
+                remote.content_fingerprint = Some("new-content".into());
+            }
+            apply_remote_snapshot_with_journal(
+                &journal,
+                &mut backend,
+                &options,
+                &client,
+                &snapshot,
+                None,
+                Some(&["item".into()]),
+                None,
+                None,
+                Some(&state),
+                &scope,
+                &mut suppressed,
+                &mut index,
+                None,
+                None,
+            )
+            .unwrap();
+            let expected = if change == "metadata" {
+                LocalEntryKind::Directory
+            } else {
+                LocalEntryKind::File
+            };
+            assert_eq!(backend.local_entries["item"].kind, expected, "{change}");
+            assert_eq!(
+                state.load_local_baseline().unwrap()["item"].kind,
+                expected,
+                "{change}"
+            );
+            assert_eq!(backend.operations.is_empty(), change == "metadata");
+        }
+    }
+
+    #[test]
+    fn unchanged_remote_echo_scheduled_before_local_changes_never_blocks_them() {
+        for (original_kind, replacement_kind) in [
+            (LocalEntryKind::File, Some(LocalEntryKind::Directory)),
+            (LocalEntryKind::Directory, Some(LocalEntryKind::File)),
+            (LocalEntryKind::File, Some(LocalEntryKind::File)),
+            (LocalEntryKind::File, None),
+            (LocalEntryKind::Directory, None),
+        ] {
+            for remote_changed in [false, true] {
+                if remote_changed && original_kind == LocalEntryKind::Directory {
+                    continue;
+                }
+                let root = crate::test_support::test_root();
+                let scope = PathScope::new(None);
+                let state = StartupStateStore::new_with_state_root(
+                    &root,
+                    &scope,
+                    "http://127.0.0.1:1",
+                    &root.join("state"),
+                );
+                let original = LocalEntryState {
+                    kind: original_kind.clone(),
+                    size_bytes: 7,
+                    modified_unix_ms: 1,
+                };
+                state
+                    .upsert_baseline_entry_with_hash("item", &original, Some("synced"))
+                    .unwrap();
+                let baseline = state.load_local_baseline().unwrap();
+                let mut local_state = baseline.clone();
+                let mut backend = RecordingBackend {
+                    local_entries: baseline.clone(),
+                    ..RecordingBackend::default()
+                };
+                backend.fingerprints.insert("item".into(), "synced".into());
+                let journal = crate::sync_work::WorkStore::open(root.join("work.sqlite")).unwrap();
+                let blocker = hold_materialization_resource(&journal, "item");
+                let entry = if original_kind == LocalEntryKind::Directory {
+                    sync_core::NamespaceEntry::directory("item")
+                } else {
+                    sync_core::NamespaceEntry::file(
+                        "item",
+                        "r1",
+                        if remote_changed {
+                            "new-remote"
+                        } else {
+                            "synced"
+                        },
+                    )
+                };
+                let snapshot = SyncSnapshot {
+                    local: vec![],
+                    remote: vec![entry],
+                };
+                let mut options = test_runtime_options();
+                options.run_once = false;
+                let client = BerryKeepClient::from_direct_base_url("http://127.0.0.1:1");
+                let mut index = RemoteTreeIndex::default();
+                let mut suppressed = BTreeMap::new();
+                apply_remote_snapshot_with_journal(
+                    &journal,
+                    &mut backend,
+                    &options,
+                    &client,
+                    &snapshot,
+                    Some(&mut local_state),
+                    None,
+                    None,
+                    None,
+                    Some(&state),
+                    &scope,
+                    &mut suppressed,
+                    &mut index,
+                    None,
+                    None,
+                )
+                .unwrap();
+                assert_eq!(journal.status("folder-materialization").unwrap().pending, 1);
+                if let Some(kind) = replacement_kind.as_ref() {
+                    backend.local_entries.insert(
+                        "item".into(),
+                        LocalEntryState {
+                            kind: kind.clone(),
+                            size_bytes: 11,
+                            modified_unix_ms: 2,
+                        },
+                    );
+                    backend.fingerprints.insert("item".into(), "edited".into());
+                } else {
+                    backend.local_entries.remove("item");
+                }
+                let before = backend.local_entries.clone();
+                journal
+                    .finish(
+                        &blocker,
+                        crate::sync_work::WorkResult::Complete,
+                        crate::sync_work::now_ms(),
+                    )
+                    .unwrap();
+                materialization::drain_remote_work(
+                    &journal,
+                    &mut backend,
+                    &options,
+                    &client,
+                    Some(&mut local_state),
+                    Some(&state),
+                    &scope,
+                    &mut suppressed,
+                    &mut index,
+                    None,
+                    None,
+                )
+                .unwrap();
+                assert!(backend.operations.is_empty());
+                assert_eq!(backend.local_entries, before);
+                assert_eq!(state.load_local_baseline().unwrap(), baseline);
+                assert_eq!(local_state, baseline);
+                let status = journal.status("folder-materialization").unwrap();
+                assert_eq!(status.conflicts, u64::from(remote_changed));
+                assert_eq!(status.completed, u64::from(!remote_changed));
+                assert_eq!(
+                    materialization::blocked_local_paths(&journal)
+                        .unwrap()
+                        .is_empty(),
+                    !remote_changed,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn queued_remote_child_preserves_a_parent_replaced_after_scheduling() {
+        for replacement in [None, Some(LocalEntryKind::File)] {
+            let root = crate::test_support::test_root();
+            let scope = PathScope::new(None);
+            let state = StartupStateStore::new_with_state_root(
+                &root,
+                &scope,
+                "http://127.0.0.1:1",
+                &root.join("state"),
+            );
+            let directory = LocalEntryState {
+                kind: LocalEntryKind::Directory,
+                size_bytes: 0,
+                modified_unix_ms: 1,
+            };
+            state.upsert_baseline_entry("parent", &directory).unwrap();
+            let mut backend = RecordingBackend::default();
+            backend.local_entries.insert("parent".into(), directory);
+            let journal = crate::sync_work::WorkStore::open(root.join("work.sqlite")).unwrap();
+            let blocker = hold_materialization_resource(&journal, "parent/new.txt");
+            let snapshot = SyncSnapshot {
+                local: vec![],
+                remote: vec![sync_core::NamespaceEntry::file(
+                    "parent/new.txt",
+                    "r1",
+                    "new-remote",
+                )],
+            };
+            let mut options = test_runtime_options();
+            options.run_once = false;
+            let client = BerryKeepClient::from_direct_base_url("http://127.0.0.1:1");
+            let mut index = RemoteTreeIndex::default();
+            let mut suppressed = BTreeMap::new();
+            apply_remote_snapshot_with_journal(
+                &journal,
+                &mut backend,
+                &options,
+                &client,
+                &snapshot,
+                None,
+                None,
+                None,
+                None,
+                Some(&state),
+                &scope,
+                &mut suppressed,
+                &mut index,
+                None,
+                None,
+            )
+            .unwrap();
+            backend.local_entries.remove("parent");
+            if let Some(kind) = replacement {
+                backend.local_entries.insert(
+                    "parent".into(),
+                    LocalEntryState {
+                        kind,
+                        size_bytes: 17,
+                        modified_unix_ms: 2,
+                    },
+                );
+            }
+            let before = backend.local_entries.clone();
+            journal
+                .finish(
+                    &blocker,
+                    crate::sync_work::WorkResult::Complete,
+                    crate::sync_work::now_ms(),
+                )
+                .unwrap();
+            materialization::drain_remote_work(
+                &journal,
+                &mut backend,
+                &options,
+                &client,
+                None,
+                Some(&state),
+                &scope,
+                &mut suppressed,
+                &mut index,
+                None,
+                None,
+            )
+            .unwrap();
+            assert!(
+                backend.operations.is_empty(),
+                "a child cannot recreate its deleted parent"
+            );
+            assert_eq!(backend.local_entries, before);
+            assert_eq!(
+                journal.status("folder-materialization").unwrap().conflicts,
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn remote_delete_preserves_content_edited_before_the_job_was_scheduled() {
+        let root = crate::test_support::test_root();
+        let scope = PathScope::new(None);
+        let state = StartupStateStore::new_with_state_root(
+            &root,
+            &scope,
+            "http://127.0.0.1:1",
+            &root.join("state"),
+        );
+        let file = LocalEntryState {
+            kind: LocalEntryKind::File,
+            size_bytes: 7,
+            modified_unix_ms: 1,
+        };
+        state
+            .upsert_baseline_entry_with_hash("a.txt", &file, Some("synced-bytes"))
+            .unwrap();
+        let journal = crate::sync_work::WorkStore::open(root.join("work.sqlite")).unwrap();
+        let mut backend = RecordingBackend::default();
+        backend.local_entries.insert("a.txt".into(), file.clone());
+        backend
+            .fingerprints
+            .insert("a.txt".into(), "edited-before-notification".into());
+        let mut options = test_runtime_options();
+        options.run_once = false;
+        let client = BerryKeepClient::from_direct_base_url("http://127.0.0.1:1");
+        let mut index = RemoteTreeIndex::default();
+        index.files.insert("a.txt".into());
+        apply_remote_snapshot_with_journal(
+            &journal,
+            &mut backend,
+            &options,
+            &client,
+            &SyncSnapshot::default(),
+            Some(&mut LocalTreeState::from([("a.txt".into(), file)])),
+            Some(&["a.txt".into()]),
+            None,
+            None,
+            Some(&state),
+            &scope,
+            &mut BTreeMap::new(),
+            &mut index,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(backend.local_entries.contains_key("a.txt"));
+        assert_eq!(
+            journal.status("folder-materialization").unwrap().conflicts,
+            1
+        );
+    }
+
+    #[test]
+    fn one_shot_reports_unfinished_work_held_by_a_live_lease() {
+        let root = crate::test_support::test_root();
+        let scope = PathScope::new(None);
+        let journal = crate::sync_work::WorkStore::open(root.join("work.sqlite")).unwrap();
+        let snapshot = SyncSnapshot {
+            local: Vec::new(),
+            remote: vec![sync_core::NamespaceEntry::file("a.txt", "r1", "hash")],
+        };
+        let plan =
+            folder_materialization_plan(&snapshot, &scope, None, &RemoteTreeIndex::default(), &[])
+                .unwrap();
+        journal.reconcile("folder-materialization", &plan).unwrap();
+        let _active = journal
+            .claim_next(
+                "folder-materialization",
+                crate::sync_work::now_ms(),
+                120_000,
+            )
+            .unwrap()
+            .unwrap();
+        let result = apply_remote_snapshot_with_journal(
+            &journal,
+            &mut RecordingBackend::default(),
+            &test_runtime_options(),
+            &BerryKeepClient::from_direct_base_url("http://127.0.0.1:1"),
+            &snapshot,
+            None,
+            Some(&[]),
+            None,
+            None,
+            None,
+            &scope,
+            &mut BTreeMap::new(),
+            &mut RemoteTreeIndex::default(),
+            None,
+            None,
+        );
+        assert!(
+            result.is_err(),
+            "one-shot sync must not advertise completion while another lease still owns unfinished work"
+        );
+    }
+
+    #[test]
+    fn retry_never_derives_deletion_or_discards_a_locally_uploaded_path() {
+        let root = crate::test_support::test_root();
+        let scope = PathScope::new(None);
+        let journal = crate::sync_work::WorkStore::open(root.join("work.sqlite")).unwrap();
+        let snapshot = SyncSnapshot {
+            local: Vec::new(),
+            remote: vec![sync_core::NamespaceEntry::file(
+                "pending.txt",
+                "r1",
+                "remote",
+            )],
+        };
+        let mut backend = RecordingBackend::with_download_failure("pending.txt");
+        let mut options = test_runtime_options();
+        options.run_once = false;
+        let client = BerryKeepClient::from_direct_base_url("http://127.0.0.1:1");
+        let mut index = RemoteTreeIndex::default();
+        let mut suppressed = BTreeMap::new();
+        apply_remote_snapshot_with_journal(
+            &journal,
+            &mut backend,
+            &options,
+            &client,
+            &snapshot,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &scope,
+            &mut suppressed,
+            &mut index,
+            None,
+            None,
+        )
+        .unwrap();
+        let uploaded = LocalEntryState {
+            kind: LocalEntryKind::File,
+            size_bytes: 10,
+            modified_unix_ms: 2,
+        };
+        backend
+            .local_entries
+            .insert("new.txt".into(), uploaded.clone());
+        index.files.insert("new.txt".into());
+        let mut local_state = LocalTreeState::from([("new.txt".into(), uploaded.clone())]);
+        let outcome = apply_remote_snapshot_with_journal(
+            &journal,
+            &mut backend,
+            &options,
+            &client,
+            &snapshot,
+            Some(&mut local_state),
+            Some(&[]),
+            None,
+            None,
+            None,
+            &scope,
+            &mut suppressed,
+            &mut index,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            backend.local_entries.get("new.txt"),
+            Some(&uploaded),
+            "retry may not reinterpret absence in an older snapshot as remote deletion"
+        );
+        assert!(
+            index.files.contains("new.txt"),
+            "upload provenance must remain for a later genuine local delete"
+        );
+        assert_eq!(
+            outcome.changed_path_count, 0,
+            "a backed-off retry must not report progress"
+        );
+        // A later real local deletion must still reach the remote executor.
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(5)))
+                            .unwrap();
+                        let mut bytes = [0; 8192];
+                        let count = stream.read(&mut bytes).unwrap();
+                        stream.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                        return String::from_utf8_lossy(&bytes[..count]).into_owned();
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10))
+                    }
+                    Err(error) => panic!("test listener failed: {error}"),
+                }
+            }
+            panic!("expected the genuine user delete to reach the server");
+        });
+        backend.local_entries.remove("new.txt");
+        let deleted = sync_local_changes(
+            &mut backend,
+            &options,
+            &BerryKeepClient::from_direct_base_url(&endpoint),
+            &mut local_state,
+            None,
+            &scope,
+            &mut index,
+            &mut suppressed,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(deleted.deleted_remote_file_count, 1);
+        assert!(server.join().unwrap().contains("new.txt"));
+    }
+
+    #[test]
+    fn unrelated_snapshot_does_not_rearm_completed_remote_creation_after_local_delete() {
+        let root = crate::test_support::test_root();
+        let scope = PathScope::new(None);
+        let journal = crate::sync_work::WorkStore::open(root.join("work.sqlite")).unwrap();
+        let mut snapshot = SyncSnapshot {
+            local: Vec::new(),
+            remote: vec![sync_core::NamespaceEntry::file("a.txt", "r1", "remote")],
+        };
+        let mut backend = RecordingBackend::default();
+        let mut options = test_runtime_options();
+        options.run_once = false;
+        let client = BerryKeepClient::from_direct_base_url("http://127.0.0.1:1");
+        let mut index = RemoteTreeIndex::default();
+        let mut suppressed = BTreeMap::new();
+        apply_remote_snapshot_with_journal(
+            &journal,
+            &mut backend,
+            &options,
+            &client,
+            &snapshot,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &scope,
+            &mut suppressed,
+            &mut index,
+            None,
+            None,
+        )
+        .unwrap();
+        backend.local_entries.remove("a.txt");
+        snapshot.remote.push(sync_core::NamespaceEntry::file(
+            "unrelated.txt",
+            "r1",
+            "remote",
+        ));
+        apply_remote_snapshot_with_journal(
+            &journal,
+            &mut backend,
+            &options,
+            &client,
+            &snapshot,
+            None,
+            Some(&["unrelated.txt".into()]),
+            None,
+            None,
+            None,
+            &scope,
+            &mut suppressed,
+            &mut index,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(
+            !backend.local_entries.contains_key("a.txt"),
+            "unchanged completed desired state cannot recreate a local deletion"
+        );
+    }
+
+    #[test]
+    fn ensuring_an_existing_directory_allows_offline_child_changes() {
+        let root = crate::test_support::test_root();
+        let scope = PathScope::new(None);
+        let state =
+            StartupStateStore::new_with_state_root(&root, &scope, "server", &root.join("state"));
+        state
+            .upsert_baseline_entry(
+                "docs",
+                &LocalEntryState {
+                    kind: LocalEntryKind::Directory,
+                    size_bytes: 0,
+                    modified_unix_ms: 1,
+                },
+            )
+            .unwrap();
+        let mut backend = RecordingBackend::default();
+        backend.local_entries.insert(
+            "docs".into(),
+            LocalEntryState {
+                kind: LocalEntryKind::Directory,
+                size_bytes: 0,
+                modified_unix_ms: 99,
+            },
+        );
+        backend.local_entries.insert(
+            "docs/local.txt".into(),
+            LocalEntryState {
+                kind: LocalEntryKind::File,
+                size_bytes: 7,
+                modified_unix_ms: 99,
+            },
+        );
+        let journal = crate::sync_work::WorkStore::open(root.join("work.sqlite")).unwrap();
+        let snapshot = SyncSnapshot {
+            local: Vec::new(),
+            remote: vec![sync_core::NamespaceEntry::directory("docs")],
+        };
+        apply_remote_snapshot_with_journal(
+            &journal,
+            &mut backend,
+            &test_runtime_options(),
+            &BerryKeepClient::from_direct_base_url("http://127.0.0.1:1"),
+            &snapshot,
+            None,
+            None,
+            None,
+            None,
+            Some(&state),
+            &scope,
+            &mut BTreeMap::new(),
+            &mut RemoteTreeIndex::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(backend.local_entries.contains_key("docs/local.txt"));
+        assert_eq!(
+            journal.status("folder-materialization").unwrap().conflicts,
+            0
+        );
+    }
+
+    #[test]
+    fn deleting_many_directories_captures_each_tree_only_once_per_batch() {
+        let root = crate::test_support::test_root();
+        let scope = PathScope::new(None);
+        let journal = crate::sync_work::WorkStore::open(root.join("work.sqlite")).unwrap();
+        let mut backend = RecordingBackend::default();
+        let mut index = RemoteTreeIndex::default();
+        let mut changed = Vec::new();
+        for number in 0..20 {
+            let path = format!("dir-{number:02}");
+            changed.push(path.clone());
+            index.directories.insert(path.clone());
+            backend.local_entries.insert(
+                path.clone(),
+                LocalEntryState {
+                    kind: LocalEntryKind::Directory,
+                    size_bytes: 0,
+                    modified_unix_ms: 1,
+                },
+            );
+            backend.local_entries.insert(
+                format!("{path}/a.txt"),
+                LocalEntryState {
+                    kind: LocalEntryKind::File,
+                    size_bytes: 7,
+                    modified_unix_ms: 1,
+                },
+            );
+        }
+        apply_remote_snapshot_with_journal(
+            &journal,
+            &mut backend,
+            &test_runtime_options(),
+            &BerryKeepClient::from_direct_base_url("http://127.0.0.1:1"),
+            &SyncSnapshot::default(),
+            None,
+            Some(&changed),
+            None,
+            None,
+            None,
+            &scope,
+            &mut BTreeMap::new(),
+            &mut index,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            backend.scan_count, 2,
+            "one capture for scheduling and one for execution, independent of directory count"
+        );
+        assert!(backend.local_entries.is_empty());
+    }
+
+    #[test]
+    fn completed_resolution_history_does_not_suppress_future_startup_conflicts() {
+        let root = crate::test_support::test_root();
+        let journal = crate::sync_work::WorkStore::open(root.join("work.sqlite")).unwrap();
+        let scope = "folder-materialization";
+        let snapshot = SyncSnapshot {
+            local: vec![],
+            remote: vec![sync_core::NamespaceEntry::file("item", "r1", "remote")],
+        };
+        let plan = folder_materialization_plan(
+            &snapshot,
+            &PathScope::new(None),
+            None,
+            &RemoteTreeIndex::default(),
+            &[],
+        )
+        .unwrap();
+        journal.reconcile(scope, &plan).unwrap();
+        let lease = journal
+            .claim_next(scope, crate::sync_work::now_ms(), 120_000)
+            .unwrap()
+            .unwrap();
+        journal
+            .finish(
+                &lease,
+                crate::sync_work::WorkResult::Conflict("edited locally".into()),
+                crate::sync_work::now_ms(),
+            )
+            .unwrap();
+        let reviewed = journal.conflicts(scope).unwrap().remove(0);
+        let mut authorized = reviewed.payload.clone();
+        authorized["resolution"] =
+            serde_json::to_value(crate::ConflictResolutionStrategy::KeepRemote).unwrap();
+        assert!(
+            journal
+                .authorize_conflict(scope, &reviewed, &authorized)
+                .unwrap()
+        );
+        let startup_choices = materialization::resolution_paths(&journal).unwrap();
+        assert_eq!(startup_choices, BTreeSet::from(["item".into()]));
+        let lease = journal
+            .claim_next(scope, crate::sync_work::now_ms(), 120_000)
+            .unwrap()
+            .unwrap();
+        journal
+            .finish(
+                &lease,
+                crate::sync_work::WorkResult::Complete,
+                crate::sync_work::now_ms(),
+            )
+            .unwrap();
+        assert_eq!(
+            journal.all_work(scope).unwrap().len(),
+            1,
+            "completed desired work retains its history"
+        );
+        assert!(
+            materialization::resolution_paths(&journal)
+                .unwrap()
+                .is_empty(),
+            "old choices cannot hide a new startup conflict"
+        );
+        assert!(
+            startup_choices.contains("item"),
+            "this startup retains its choice even when execution completes"
+        );
+    }
+
+    #[test]
+    fn queued_conflicts_use_explicit_existing_resolution_actions() {
+        for strategy in [
+            crate::ConflictResolutionStrategy::KeepRemote,
+            crate::ConflictResolutionStrategy::KeepLocal,
+        ] {
+            let root = crate::test_support::test_root();
+            let scope = PathScope::new(None);
+            let state = StartupStateStore::new_with_state_root(
+                &root,
+                &scope,
+                "http://127.0.0.1:1",
+                &root.join("state"),
+            );
+            let local = LocalEntryState {
+                kind: LocalEntryKind::File,
+                size_bytes: 7,
+                modified_unix_ms: 1,
+            };
+            state
+                .upsert_baseline_entry_with_hash("a.txt", &local, Some("previous-synced"))
+                .unwrap();
+            let journal = materialization::open(&state).unwrap();
+            let mut backend = RecordingBackend {
+                allow_upload: true,
+                ..RecordingBackend::default()
+            };
+            backend.local_entries.insert("a.txt".into(), local.clone());
+            backend
+                .fingerprints
+                .insert("a.txt".into(), "edited-local".into());
+            let mut options = test_runtime_options();
+            options.run_once = false;
+            let client = BerryKeepClient::from_direct_base_url("http://127.0.0.1:1");
+            let snapshot = SyncSnapshot {
+                local: Vec::new(),
+                remote: vec![sync_core::NamespaceEntry::file(
+                    "a.txt",
+                    "r1",
+                    "fingerprint-a.txt",
+                )],
+            };
+            let mut index = RemoteTreeIndex::default();
+            let mut suppressed = BTreeMap::new();
+            apply_remote_snapshot_with_journal(
+                &journal,
+                &mut backend,
+                &options,
+                &client,
+                &snapshot,
+                None,
+                None,
+                None,
+                None,
+                Some(&state),
+                &scope,
+                &mut suppressed,
+                &mut index,
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                state
+                    .load_conflict("a.txt")
+                    .unwrap()
+                    .map(|conflict| conflict.reason),
+                Some("queued_remote_materialization".into()),
+                "queued conflicts must appear in the existing list/UI"
+            );
+            backend
+                .local_entries
+                .get_mut("a.txt")
+                .unwrap()
+                .modified_unix_ms = 2;
+            materialization::drain_remote_work(
+                &journal,
+                &mut backend,
+                &options,
+                &client,
+                None,
+                Some(&state),
+                &scope,
+                &mut suppressed,
+                &mut index,
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                journal.status("folder-materialization").unwrap().conflicts,
+                1,
+                "editing a conflicted path is not permission to overwrite it"
+            );
+            assert!(backend.operations.is_empty());
+            crate::resolve_conflict_action(
+                &root,
+                Some("http://127.0.0.1:1"),
+                None,
+                None,
+                None,
+                &scope,
+                &state,
+                "a.txt",
+                strategy,
+                false,
+            )
+            .unwrap();
+            materialization::drain_remote_work(
+                &journal,
+                &mut backend,
+                &options,
+                &client,
+                None,
+                Some(&state),
+                &scope,
+                &mut suppressed,
+                &mut index,
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                journal.status("folder-materialization").unwrap().conflicts,
+                0
+            );
+            assert_eq!(journal.status("folder-materialization").unwrap().pending, 0);
+            assert!(state.load_conflict("a.txt").unwrap().is_none());
+            if matches!(strategy, crate::ConflictResolutionStrategy::KeepRemote) {
+                assert_eq!(
+                    backend
+                        .backups
+                        .get("a.txt")
+                        .map(|state| state.modified_unix_ms),
+                    Some(2)
+                );
+            }
+            match strategy {
+                crate::ConflictResolutionStrategy::KeepRemote=>assert!(backend.operations.iter().any(|operation|matches!(operation,BackendOperation::DownloadFile{local_path,..} if local_path=="a.txt"))),
+                crate::ConflictResolutionStrategy::KeepLocal=>assert_eq!(state.load_local_baseline_hashes().unwrap().get("a.txt").map(String::as_str),Some("edited-local")),
+            }
+        }
+    }
+
+    #[test]
+    fn local_scans_retain_baselines_for_unresolved_remote_work() {
+        for directory in [false, true] {
+            let mut backend = RecordingBackend::default();
+            let path = if directory { "docs" } else { "a.txt" };
+            let baseline = LocalEntryState {
+                kind: if directory {
+                    LocalEntryKind::Directory
+                } else {
+                    LocalEntryKind::File
+                },
+                size_bytes: 7,
+                modified_unix_ms: 1,
+            };
+            if !directory {
+                backend.local_entries.insert(
+                    path.into(),
+                    LocalEntryState {
+                        modified_unix_ms: 2,
+                        ..baseline.clone()
+                    },
+                );
+            }
+            let mut state = LocalTreeState::from([(path.into(), baseline.clone())]);
+            let mut index = RemoteTreeIndex::default();
+            if directory {
+                index.directories.insert(path.into());
+            } else {
+                index.files.insert(path.into());
+            }
+            let blocked = BTreeSet::from([if directory {
+                "docs/incoming.txt".into()
+            } else {
+                path.into()
+            }]);
+            let result = sync_local_changes(
+                &mut backend,
+                &test_runtime_options(),
+                &BerryKeepClient::from_direct_base_url("http://127.0.0.1:1"),
+                &mut state,
+                None,
+                &PathScope::new(None),
+                &mut index,
+                &mut BTreeMap::new(),
+                None,
+                None,
+                None,
+                None,
+                Some(&blocked),
+            )
+            .unwrap();
+            assert_eq!(result.changed_path_count, 0);
+            assert_eq!(state.get(path), Some(&baseline));
+            assert!(backend.operations.is_empty());
+        }
     }
 
     #[test]

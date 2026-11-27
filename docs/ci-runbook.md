@@ -163,6 +163,10 @@ check (which depends on `ios-build`) is unaffected.
 
 ## Required checks (branch protection alignment)
 
+The web smoke matrix uses Ubuntu 24.04 because the locked Playwright version
+supports that browser host. Update the runner and Playwright together; a moving
+`ubuntu-latest` image can fail browser installation before any smoke test runs.
+
 For branch `main`, require these stable aggregate status checks:
 
 - `Required CI`

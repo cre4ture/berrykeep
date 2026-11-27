@@ -17886,9 +17886,8 @@ async fn delete_object_response(
     if query.version_id.is_some() && !query.internal_replication {
         return StatusCode::BAD_REQUEST.into_response();
     }
-    if query.object_id.is_some() && key.ends_with('/') && !query.recursive {
-        return StatusCode::BAD_REQUEST.into_response();
-    }
+    let nonrecursive_directory_by_id =
+        query.object_id.is_some() && key.ends_with('/') && !query.recursive;
 
     let version_state = match query.state.as_deref() {
         None | Some("confirmed") => VersionConsistencyState::Confirmed,
@@ -17896,7 +17895,10 @@ async fn delete_object_response(
         Some(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
     let recursive = query.recursive
-        || (key.ends_with('/') && !query.internal_replication && query.version_id.is_none());
+        || (query.object_id.is_none()
+            && key.ends_with('/')
+            && !query.internal_replication
+            && query.version_id.is_none());
     if recursive && (!query.parent.is_empty() || query.version_id.is_some()) {
         return StatusCode::BAD_REQUEST.into_response();
     }
@@ -17927,6 +17929,20 @@ async fn delete_object_response(
         };
         if current_revision.as_deref() != Some(expected_revision) {
             return StatusCode::CONFLICT.into_response();
+        }
+    }
+    // The directory marker revision does not change when children are added.
+    // Check the live namespace under the same store lock as the tombstone so
+    // guarded child deletes cannot accidentally authorize a recursive removal
+    // of a child that arrived after the client's observation.
+    if nonrecursive_directory_by_id {
+        match store.has_current_object_descendants(&key).await {
+            Ok(true) => return StatusCode::CONFLICT.into_response(),
+            Ok(false) => {}
+            Err(err) => {
+                tracing::error!(error = %err, path = %key, "failed checking directory descendants before delete");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
         }
     }
     let tombstone_options = PutOptions {

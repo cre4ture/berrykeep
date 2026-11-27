@@ -65,6 +65,27 @@ pub fn resolve_conflict_action(
 ) -> Result<ConflictResolutionResult> {
     let normalized_path = validate_user_relative_path_input(path)?;
 
+    if let Some(conflict) = state_store
+        .load_conflict(&normalized_path)?
+        .filter(|conflict| conflict.reason == "queued_remote_materialization")
+    {
+        crate::folder_agent_runtime::materialization::authorize_queued_conflict(
+            state_store,
+            &conflict,
+            strategy,
+            delete_conflict_copies_on_finish,
+        )?;
+        let removed_conflict_rows = state_store.remove_conflict(&normalized_path)?;
+        return Ok(ConflictResolutionResult {
+            path: normalized_path,
+            strategy,
+            conflict_reason: Some(conflict.reason),
+            action: "scheduled_explicit_resolution".into(),
+            removed_conflict_rows,
+            removed_conflict_copy_files: 0,
+        });
+    }
+
     match strategy {
         ConflictResolutionStrategy::KeepLocal => {
             let removed_conflict_rows = state_store.remove_conflict(normalized_path.as_str())?;
@@ -403,14 +424,15 @@ fn file_content_hash(path: &Path) -> Result<String> {
     })
 }
 
-fn preserve_local_conflict_copy(
+pub(crate) fn preserve_local_conflict_copy(
     root_dir: &Path,
     relative_path: &str,
     local_target: &Path,
 ) -> Result<()> {
-    if !local_target.is_file() {
+    if !local_target.exists() {
         return Ok(());
     }
+    let directory = local_target.is_dir();
 
     let timestamp = current_unix_ms();
     let local_backup_dir = conflict_copy_dir(root_dir, "local", relative_path);
@@ -426,7 +448,15 @@ fn preserve_local_conflict_copy(
         .unwrap_or_else(|| "object".to_string());
     let backup_target = local_backup_dir.join(format!("{file_name}.local-conflict-{timestamp}"));
 
-    if fs::rename(local_target, &backup_target).is_err() {
+    if let Err(rename_error) = fs::rename(local_target, &backup_target) {
+        if directory {
+            return Err(rename_error).with_context(|| {
+                format!(
+                    "failed to preserve local directory {}",
+                    local_target.display()
+                )
+            });
+        }
         fs::copy(local_target, &backup_target).with_context(|| {
             format!(
                 "failed to copy local file {} to backup {}",

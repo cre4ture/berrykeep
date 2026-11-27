@@ -512,8 +512,35 @@ pub(crate) fn reconcile_remote_object_state_best_effort(
     provider_instance_id: Uuid,
     resolver: Option<&dyn RemoteObjectResolver>,
 ) -> RemoteObjectReconcileReport {
+    reconcile_remote_object_state_with_protected_ids(
+        sync_root_path,
+        current_snapshot,
+        object_changes,
+        provider_instance_id,
+        resolver,
+        &BTreeSet::new(),
+    )
+}
+
+pub(crate) fn reconcile_remote_object_state_with_protected_ids(
+    sync_root_path: &Path,
+    current_snapshot: &SyncSnapshot,
+    object_changes: &[RemoteObjectChange],
+    provider_instance_id: Uuid,
+    resolver: Option<&dyn RemoteObjectResolver>,
+    protected: &BTreeSet<String>,
+) -> RemoteObjectReconcileReport {
     let mut report = RemoteObjectReconcileReport::default();
     let mut local_placeholders = scan_local_placeholders(sync_root_path);
+    for object_id in protected {
+        local_placeholders.record_preserved(object_id, &mut report);
+    }
+    local_placeholders
+        .unique
+        .retain(|object_id, _| !protected.contains(object_id));
+    local_placeholders
+        .ambiguous
+        .retain(|object_id, _| !protected.contains(object_id));
     report
         .preserved_paths
         .extend(local_placeholders.undecodable_paths.iter().cloned());

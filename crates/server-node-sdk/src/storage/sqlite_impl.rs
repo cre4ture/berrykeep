@@ -2524,6 +2524,19 @@ impl MetadataStore for SqliteMetadataStore {
         .await
     }
 
+    async fn has_current_object_descendants(&self, directory_key: &str) -> Result<bool> {
+        let upper = super::directory_descendant_upper_bound(directory_key)?;
+        let lower = directory_key.to_owned();
+        self.read(move |db| {
+            Ok(db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM current_objects WHERE key > ?1 AND key < ?2)",
+                params![lower, upper],
+                |row| row.get::<_, bool>(0),
+            )?)
+        })
+        .await
+    }
+
     async fn list_keys_for_object_id(&self, object_id: &str) -> Result<Vec<String>> {
         let object_id = object_id.to_string();
         self.read(move |db| {

@@ -15769,7 +15769,7 @@ async fn object_id_api_serializes_and_mutates_by_identity_impl(backend: MainTest
         }),
     )
     .await;
-    assert_eq!(rejected_directory_delete.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(rejected_directory_delete.status(), StatusCode::CONFLICT);
     {
         let store = lock_store(&state, "tests.object-id-directory-intact").await;
         assert_eq!(
@@ -15818,6 +15818,175 @@ run_on_main_metadata_backends!(
     object_id_api_serializes_and_mutates_by_identity_impl,
     object_id_api_serializes_and_mutates_by_identity,
     object_id_api_serializes_and_mutates_by_identity_turso
+);
+
+fn nonrecursive_marker_query(revision: Option<&str>) -> super::PutObjectQuery {
+    super::PutObjectQuery {
+        state: None,
+        parent: Vec::new(),
+        expected_revision: revision.map(str::to_owned),
+        object_id: None,
+        version_id: None,
+        internal_replication: false,
+        recursive: false,
+    }
+}
+
+async fn put_marker_test_object(
+    state: &ServerState,
+    path: &str,
+    contents: &'static [u8],
+) -> super::ObjectMutationResponse {
+    let response = super::put_object(
+        State(state.clone()),
+        HeaderMap::new(),
+        Path(path.to_owned()),
+        Query(nonrecursive_marker_query(None)),
+        Bytes::from_static(contents),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap()
+}
+
+async fn delete_marker_test_object(
+    state: &ServerState,
+    object: &super::ObjectMutationResponse,
+    revision: &str,
+) -> axum::response::Response {
+    super::delete_object_by_id(
+        State(state.clone()),
+        HeaderMap::new(),
+        Path(object.object_id.clone()),
+        Query(nonrecursive_marker_query(Some(revision))),
+    )
+    .await
+}
+
+async fn nonrecursive_object_id_directory_delete_requires_empty_live_namespace_impl(
+    backend: MainTestBackend,
+) {
+    let state = build_test_state(1, false, backend).await;
+    let directory = put_marker_test_object(&state, "guarded-directory/", b"").await;
+    assert_eq!(
+        delete_marker_test_object(&state, &directory, "stale-revision")
+            .await
+            .status(),
+        StatusCode::CONFLICT,
+        "an empty marker still requires its exact expected revision"
+    );
+
+    let child = put_marker_test_object(&state, "guarded-directory/child.txt", b"first").await;
+    assert_eq!(
+        delete_marker_test_object(&state, &directory, &directory.revision)
+            .await
+            .status(),
+        StatusCode::CONFLICT,
+        "a nonrecursive marker delete must preserve live descendants"
+    );
+    assert_eq!(
+        delete_marker_test_object(&state, &child, &child.revision)
+            .await
+            .status(),
+        StatusCode::CREATED
+    );
+
+    // A new child does not advance the marker revision. It must still block
+    // deletion after the client's originally observed children were removed.
+    let late_child = put_marker_test_object(&state, "guarded-directory/new.txt", b"late").await;
+    assert_eq!(
+        delete_marker_test_object(&state, &directory, &directory.revision)
+            .await
+            .status(),
+        StatusCode::CONFLICT
+    );
+    {
+        let store = lock_store(&state, "tests.guarded-directory-child").await;
+        assert_eq!(
+            store
+                .get_object(
+                    &late_child.path,
+                    None,
+                    None,
+                    super::storage::ObjectReadMode::Preferred,
+                )
+                .await
+                .unwrap(),
+            Bytes::from_static(b"late")
+        );
+    }
+    assert_eq!(
+        delete_marker_test_object(&state, &late_child, &late_child.revision)
+            .await
+            .status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        delete_marker_test_object(&state, &directory, &directory.revision)
+            .await
+            .status(),
+        StatusCode::CREATED,
+        "tombstoned descendants must not prevent removal of the empty marker"
+    );
+    {
+        let store = lock_store(&state, "tests.guarded-directory-removed").await;
+        assert!(
+            !store
+                .current_keys()
+                .await
+                .unwrap()
+                .contains(&directory.path)
+        );
+    }
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    nonrecursive_object_id_directory_delete_requires_empty_live_namespace_impl,
+    nonrecursive_object_id_directory_delete_requires_empty_live_namespace,
+    nonrecursive_object_id_directory_delete_requires_empty_live_namespace_turso
+);
+
+async fn nonrecursive_object_id_directory_delete_uses_literal_case_sensitive_prefix_impl(
+    backend: MainTestBackend,
+) {
+    let state = build_test_state(1, false, backend).await;
+    for (marker, neighbor) in [
+        ("literal_%/", "literal_x/child.txt"),
+        ("Case/", "case/child.txt"),
+        ("日本語/", "日本語-extra/child.txt"),
+    ] {
+        let directory = put_marker_test_object(&state, marker, b"").await;
+        put_marker_test_object(&state, neighbor, b"neighbor").await;
+        assert_eq!(
+            delete_marker_test_object(&state, &directory, &directory.revision)
+                .await
+                .status(),
+            StatusCode::CREATED,
+            "a sibling with a similar prefix must not block {marker}"
+        );
+        let store = lock_store(&state, "tests.guarded-directory-neighbor").await;
+        assert_eq!(
+            store
+                .get_object(
+                    neighbor,
+                    None,
+                    None,
+                    super::storage::ObjectReadMode::Preferred,
+                )
+                .await
+                .unwrap(),
+            Bytes::from_static(b"neighbor")
+        );
+    }
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    nonrecursive_object_id_directory_delete_uses_literal_case_sensitive_prefix_impl,
+    nonrecursive_object_id_directory_delete_uses_literal_case_sensitive_prefix,
+    nonrecursive_object_id_directory_delete_uses_literal_case_sensitive_prefix_turso
 );
 
 async fn execute_public_object_id_transport_request(
