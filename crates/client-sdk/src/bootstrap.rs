@@ -596,8 +596,8 @@ impl ConnectionBootstrap {
         build_http_client_with_identity_from_planned_targets(&planned_targets, identity)
     }
 
-    /// Renews an expired, expiring, or legacy rendezvous client certificate when a direct target
-    /// is available.
+    /// Renews a rendezvous client certificate after thirty days, near expiry, or when it lacks
+    /// the expected cluster URI SAN, using an available authenticated route.
     ///
     /// Legacy certificates that do not contain this bootstrap's cluster URI SAN cannot complete
     /// rendezvous mTLS.  Their renewal request is therefore deliberately restricted to direct
@@ -702,8 +702,8 @@ impl ConnectionBootstrap {
     }
 
     /// Like [`build_client_with_identity`] but automatically renews the rendezvous client
-    /// certificate when it is expired, expiring soon, or missing the expected cluster URI SAN.
-    /// If renewal succeeds the updated PEM is written back into
+    /// certificate when it is thirty days old, expiring soon, or missing the expected cluster
+    /// URI SAN. If renewal succeeds the updated PEM is written back into
     /// `identity.rendezvous_client_identity_pem`; the caller is responsible for persisting the
     /// change. Renewal failures are logged as warnings and do not prevent the client from being
     /// built.
