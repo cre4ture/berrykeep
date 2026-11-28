@@ -147,6 +147,10 @@ To keep the first slice low-effort and reviewable, the implementation makes the 
 - Startup behavior:
   - first-slice automatic renewal runs from the background renewal loop after node startup,
   - it is not attempted before listener startup because issuer resolution now depends on live cluster membership.
+- Live outbound rotation:
+  - renewal rebuilds outbound clients and replaces the relay wake tasks that own the previous clients,
+  - existing wake channels reconnect with the renewed identity even when rendezvous URLs stay the same,
+  - the same task replacement applies when rendezvous trust roots are reloaded; a server restart is not required.
 
 ### Expired credential recovery
 

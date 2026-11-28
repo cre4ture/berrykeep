@@ -1055,7 +1055,18 @@ impl ServerDirectQuicRuntime {
 #[derive(Clone)]
 struct RendezvousEndpointClient {
     url: String,
-    control: RendezvousControlClient,
+    control: Arc<RendezvousControlClient>,
+}
+
+struct RendezvousRelayWakeTask {
+    control: Arc<RendezvousControlClient>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for RendezvousRelayWakeTask {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -5800,7 +5811,7 @@ fn build_rendezvous_control_clients(
         )?;
         endpoints.push(RendezvousEndpointClient {
             url: url.clone(),
-            control,
+            control: Arc::new(control),
         });
     }
 
@@ -12150,31 +12161,30 @@ fn spawn_rendezvous_relay_wake_task(
     })
 }
 
-fn spawn_rendezvous_relay_multiplex_agent(state: ServerState) {
+fn spawn_rendezvous_relay_multiplex_agent(state: ServerState) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut accept_tasks: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
+        let mut accept_tasks: HashMap<String, RendezvousRelayWakeTask> = HashMap::new();
 
         loop {
             let clients = current_rendezvous_endpoint_clients(&state).await;
             if clients.is_empty() {
-                for (_, handle) in accept_tasks.drain() {
-                    handle.abort();
-                }
+                accept_tasks.clear();
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 continue;
             }
 
-            let active_urls = clients
+            let active_clients = clients
                 .iter()
-                .map(|endpoint| endpoint.url.clone())
-                .collect::<HashSet<_>>();
+                .map(|endpoint| (endpoint.url.as_str(), &endpoint.control))
+                .collect::<HashMap<_, _>>();
 
-            accept_tasks.retain(|url, handle| {
-                let keep = active_urls.contains(url) && !handle.is_finished();
-                if !keep {
-                    handle.abort();
-                }
-                keep
+            // TLS reloads replace the control client even when its URL stays the same.
+            // Drop the old task so its next connection uses the refreshed identity and roots.
+            accept_tasks.retain(|url, task| {
+                active_clients
+                    .get(url.as_str())
+                    .is_some_and(|control| Arc::ptr_eq(control, &task.control))
+                    && !task.handle.is_finished()
             });
 
             for endpoint in clients {
@@ -12183,13 +12193,16 @@ fn spawn_rendezvous_relay_multiplex_agent(state: ServerState) {
                 }
                 accept_tasks.insert(
                     endpoint.url.clone(),
-                    spawn_rendezvous_relay_wake_task(state.clone(), endpoint),
+                    RendezvousRelayWakeTask {
+                        control: endpoint.control.clone(),
+                        handle: spawn_rendezvous_relay_wake_task(state.clone(), endpoint),
+                    },
                 );
             }
 
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
-    });
+    })
 }
 
 fn spawn_replication_auditor(state: ServerState, interval_secs: u64) {

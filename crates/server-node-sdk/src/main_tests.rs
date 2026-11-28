@@ -1628,12 +1628,54 @@ fn spawn_mtls_client_fingerprint_capture_server(
     cert_path: &std::path::Path,
     key_path: &std::path::Path,
     captured_fingerprint: Arc<Mutex<Option<String>>>,
+    captured_wake_fingerprint: Arc<Mutex<Option<String>>>,
 ) -> tokio::task::JoinHandle<()> {
     let app = Router::new()
         .route("/health", get(capture_mtls_health))
         .route(
             "/control/presence/register",
             axum::routing::post(capture_mtls_presence_register),
+        )
+        .route(
+            "/relay/wake/ws",
+            get(
+                move |Extension(fingerprint): Extension<String>,
+                      websocket: axum::extract::WebSocketUpgrade| {
+                    let captured = captured_wake_fingerprint.clone();
+                    async move {
+                        websocket.on_upgrade(move |mut socket| async move {
+                            let Some(Ok(axum::extract::ws::Message::Text(registration))) =
+                                socket.recv().await
+                            else {
+                                return;
+                            };
+                            assert!(matches!(
+                                serde_json::from_str::<transport_sdk::RelayWakeControlMessage>(
+                                    &registration
+                                )
+                                .unwrap(),
+                                transport_sdk::RelayWakeControlMessage::Register { .. }
+                            ));
+                            *captured.lock().await = Some(fingerprint);
+                            socket
+                                .send(axum::extract::ws::Message::Text(
+                                    serde_json::to_string(
+                                        &transport_sdk::RelayWakeControlMessage::Registered,
+                                    )
+                                    .unwrap()
+                                    .into(),
+                                ))
+                                .await
+                                .unwrap();
+                            while let Some(Ok(message)) = socket.recv().await {
+                                if matches!(message, axum::extract::ws::Message::Close(_)) {
+                                    break;
+                                }
+                            }
+                        })
+                    }
+                },
+            ),
         )
         .with_state(captured_fingerprint);
     let tls_config = super::build_internal_mtls_rustls_config(
@@ -11737,12 +11779,14 @@ async fn live_tls_reload_rebuilds_outbound_internal_and_rendezvous_clients() {
     std::fs::write(&capture_server_key_path, &capture_server_material.key_pem).unwrap();
 
     let captured_fingerprint = Arc::new(Mutex::new(None));
+    let captured_wake_fingerprint = Arc::new(Mutex::new(None));
     let capture_handle = spawn_mtls_client_fingerprint_capture_server(
         capture_bind_addr,
         &capture_ca_path,
         &capture_server_cert_path,
         &capture_server_key_path,
         captured_fingerprint.clone(),
+        captured_wake_fingerprint.clone(),
     );
     wait_for_condition("capture server ready", Duration::from_secs(5), || {
         let capture_ca_path = capture_ca_path.clone();
@@ -11825,6 +11869,18 @@ async fn live_tls_reload_rebuilds_outbound_internal_and_rendezvous_clients() {
         Some(initial_internal_fingerprint.clone())
     );
 
+    let wake_agent = super::spawn_rendezvous_relay_multiplex_agent(state.clone());
+    wait_for_condition(
+        "initial relay wake identity",
+        Duration::from_secs(5),
+        || {
+            let captured = captured_wake_fingerprint.clone();
+            let expected = initial_internal_fingerprint.clone();
+            async move { captured.lock().await.as_ref() == Some(&expected) }
+        },
+    )
+    .await;
+
     assert!(
         super::renew_node_enrollment_package_if_due(&state, &config)
             .await
@@ -11858,8 +11914,22 @@ async fn live_tls_reload_rebuilds_outbound_internal_and_rendezvous_clients() {
     rendezvous.register_presence(&registration).await.unwrap();
     assert_eq!(
         captured_fingerprint.lock().await.clone(),
-        Some(renewed_internal_fingerprint)
+        Some(renewed_internal_fingerprint.clone())
     );
+
+    wait_for_condition(
+        "renewed relay wake identity",
+        Duration::from_secs(5),
+        || {
+            let captured = captured_wake_fingerprint.clone();
+            let expected = renewed_internal_fingerprint.clone();
+            async move { captured.lock().await.as_ref() == Some(&expected) }
+        },
+    )
+    .await;
+
+    wake_agent.abort();
+    let _ = wake_agent.await;
 
     cleanup_test_state(&state).await;
     capture_handle.abort();
@@ -26144,11 +26214,11 @@ async fn rendezvous_presence_heartbeat_retries_all_endpoints_until_all_connected
             rendezvous_controls: vec![
                 super::RendezvousEndpointClient {
                     url: rendezvous_url_a.clone(),
-                    control: client_a,
+                    control: Arc::new(client_a),
                 },
                 super::RendezvousEndpointClient {
                     url: rendezvous_url_b.clone(),
-                    control: client_b,
+                    control: Arc::new(client_b),
                 },
             ],
         },
