@@ -525,7 +525,7 @@ fn build_tls_client_config(
     server_ca_pem: Option<&str>,
     client_identity_pem: Option<&[u8]>,
 ) -> Result<rustls::ClientConfig> {
-    crate::websocket_client::build_tls_client_config(server_ca_pem, client_identity_pem, None)
+    crate::websocket_client::build_rendezvous_tls_client_config(server_ca_pem, client_identity_pem)
         .context("failed building relay tunnel TLS client config")
 }
 

@@ -70,8 +70,9 @@ Purpose: fast bootstrap for coding sessions without replaying full tool/chat his
 - Live certificate or trust-root reloads replace relay wake tasks by client instance,
   so unchanged rendezvous URLs cannot retain expired credentials.
 - Rendezvous WebSocket connections combine platform and configured private roots,
-  matching HTTP trust for mixed public/private services. Stable node identity
-  connections retain their explicit CA scope.
+  matching HTTP trust for mixed public/private services. Direct connections retain
+  their configured CA scope, with or without a stable node identity; only the
+  rendezvous wake and relay tunnel callers opt into combining trust roots.
 - Quick validation: `cargo +stable test -p transport-sdk -p server-node-sdk --lib`.
 - Source of truth: `crates/server-node-sdk/src/lib.rs`,
   `crates/transport-sdk/src/websocket_client.rs`, and the node certificate renewal

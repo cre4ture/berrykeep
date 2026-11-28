@@ -27,8 +27,9 @@ encrypted inner TLS stream, not application payloads or inner TLS termination.
 Outbound rendezvous HTTP and WebSocket connections trust the platform roots plus
 any configured private rendezvous CA. This allows a node to use private LAN
 services and public CA-signed global services together while still checking each
-service's hostname or IP address. Direct connections bound to a stable node
-identity retain their explicit CA scope.
+service's hostname or IP address. Direct connections retain their configured CA
+scope, with or without a stable node identity. Only the rendezvous wake and relay
+tunnel callers opt into combining platform and private roots.
 
 ## Phase-2 configuration contract
 

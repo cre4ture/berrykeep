@@ -6,7 +6,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::peer::PeerIdentity;
 use crate::relay::RelayTunnelSessionKind;
-use crate::websocket_client::{AsyncIo, connect_websocket, websocket_url};
+use crate::websocket_client::{AsyncIo, connect_rendezvous_websocket, websocket_url};
 use common::ClusterId;
 
 /// A node's registration for the long-lived relay "wake" channel: instead of
@@ -59,7 +59,7 @@ impl RelayWakeClient {
         registration.validate()?;
         let url = websocket_url(base_url, "relay/wake/ws")
             .with_context(|| format!("failed building relay wake URL from {base_url}"))?;
-        let mut websocket = connect_websocket(&url, server_ca_pem, client_identity_pem, &[])
+        let mut websocket = connect_rendezvous_websocket(&url, server_ca_pem, client_identity_pem)
             .await
             .context("relay wake websocket handshake failed")?;
 

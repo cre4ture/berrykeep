@@ -40,6 +40,12 @@ pub struct ExpectedNodeServerIdentity {
     pub cluster_id: ClusterId,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RootTrustScope {
+    ConfiguredCa,
+    PlatformAndConfiguredCa,
+}
+
 pub async fn connect_websocket(
     url: &Url,
     server_ca_pem: Option<&str>,
@@ -63,11 +69,47 @@ pub async fn connect_websocket_with_expected_server_identity(
     expected_server_identity: Option<ExpectedNodeServerIdentity>,
     headers: &[(String, String)],
 ) -> Result<WebSocketStream<Box<dyn AsyncIo>>> {
+    connect_websocket_with_root_trust(
+        url,
+        server_ca_pem,
+        client_identity_pem,
+        expected_server_identity,
+        headers,
+        RootTrustScope::ConfiguredCa,
+    )
+    .await
+}
+
+pub(crate) async fn connect_rendezvous_websocket(
+    url: &Url,
+    server_ca_pem: Option<&str>,
+    client_identity_pem: Option<&[u8]>,
+) -> Result<WebSocketStream<Box<dyn AsyncIo>>> {
+    connect_websocket_with_root_trust(
+        url,
+        server_ca_pem,
+        client_identity_pem,
+        None,
+        &[],
+        RootTrustScope::PlatformAndConfiguredCa,
+    )
+    .await
+}
+
+async fn connect_websocket_with_root_trust(
+    url: &Url,
+    server_ca_pem: Option<&str>,
+    client_identity_pem: Option<&[u8]>,
+    expected_server_identity: Option<ExpectedNodeServerIdentity>,
+    headers: &[(String, String)],
+    root_trust_scope: RootTrustScope,
+) -> Result<WebSocketStream<Box<dyn AsyncIo>>> {
     let stream = open_websocket_io(
         url,
         server_ca_pem,
         client_identity_pem,
         expected_server_identity,
+        root_trust_scope,
     )
     .await?;
     let mut request = url
@@ -109,6 +151,7 @@ async fn open_websocket_io(
     server_ca_pem: Option<&str>,
     client_identity_pem: Option<&[u8]>,
     expected_server_identity: Option<ExpectedNodeServerIdentity>,
+    root_trust_scope: RootTrustScope,
 ) -> Result<Box<dyn AsyncIo>> {
     let host = url
         .host_str()
@@ -128,11 +171,14 @@ async fn open_websocket_io(
                 .context("failed building TLS server name")?;
             let tls_stream = timeout(
                 WEBSOCKET_CONNECT_TIMEOUT,
-                TlsConnector::from(std::sync::Arc::new(build_tls_client_config(
-                    server_ca_pem,
-                    client_identity_pem,
-                    expected_server_identity,
-                )?))
+                TlsConnector::from(std::sync::Arc::new(
+                    build_tls_client_config_with_root_trust(
+                        server_ca_pem,
+                        client_identity_pem,
+                        expected_server_identity,
+                        root_trust_scope,
+                    )?,
+                ))
                 .connect(server_name, tcp),
             )
             .await
@@ -148,16 +194,44 @@ async fn open_websocket_io(
     }
 }
 
+/// Builds direct-connection TLS configuration. A supplied CA defines the trust scope,
+/// even when the caller does not provide a stable node identity.
 pub fn build_tls_client_config(
     server_ca_pem: Option<&str>,
     client_identity_pem: Option<&[u8]>,
     expected_server_identity: Option<ExpectedNodeServerIdentity>,
 ) -> Result<rustls::ClientConfig> {
+    build_tls_client_config_with_root_trust(
+        server_ca_pem,
+        client_identity_pem,
+        expected_server_identity,
+        RootTrustScope::ConfiguredCa,
+    )
+}
+
+pub(crate) fn build_rendezvous_tls_client_config(
+    server_ca_pem: Option<&str>,
+    client_identity_pem: Option<&[u8]>,
+) -> Result<rustls::ClientConfig> {
+    build_tls_client_config_with_root_trust(
+        server_ca_pem,
+        client_identity_pem,
+        None,
+        RootTrustScope::PlatformAndConfiguredCa,
+    )
+}
+
+fn build_tls_client_config_with_root_trust(
+    server_ca_pem: Option<&str>,
+    client_identity_pem: Option<&[u8]>,
+    expected_server_identity: Option<ExpectedNodeServerIdentity>,
+    root_trust_scope: RootTrustScope,
+) -> Result<rustls::ClientConfig> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let roots = websocket_root_certificates(
         server_ca_pem,
-        expected_server_identity,
+        root_trust_scope,
         rustls_native_certs::load_native_certs,
     )?;
 
@@ -196,7 +270,7 @@ pub fn build_tls_client_config(
 
 fn websocket_root_certificates(
     server_ca_pem: Option<&str>,
-    expected_server_identity: Option<ExpectedNodeServerIdentity>,
+    root_trust_scope: RootTrustScope,
     load_native_certs: impl FnOnce() -> rustls_native_certs::CertificateResult,
 ) -> Result<RootCertStore> {
     let mut roots = RootCertStore::empty();
@@ -213,9 +287,9 @@ fn websocket_root_certificates(
         }
     }
 
-    // Locator-validated services can mix public and private CAs, just like HTTP.
-    // An explicit CA for stable node identity validation remains the trust boundary.
-    if server_ca_pem.is_none() || expected_server_identity.is_none() {
+    // Only rendezvous callers opt into mixing platform roots with their private CA.
+    // Direct connections retain their configured CA scope, with or without a node identity.
+    if server_ca_pem.is_none() || root_trust_scope == RootTrustScope::PlatformAndConfiguredCa {
         let native = load_native_certs();
         let _ = roots.add_parsable_certificates(native.certs);
         if roots.is_empty() {
@@ -498,9 +572,11 @@ mod tests {
         let (native_ca, _, native_server) = test_ca_and_server_certificate();
         let (_, custom_ca_pem, custom_server) = test_ca_and_server_certificate();
         let (_, _, untrusted_server) = test_ca_and_server_certificate();
-        let roots = websocket_root_certificates(Some(&custom_ca_pem), None, || {
-            native_certificates(vec![native_ca])
-        })
+        let roots = websocket_root_certificates(
+            Some(&custom_ca_pem),
+            RootTrustScope::PlatformAndConfiguredCa,
+            || native_certificates(vec![native_ca]),
+        )
         .unwrap();
 
         assert_server_trust(&roots, &native_server, "rendezvous.example", true);
@@ -510,28 +586,40 @@ mod tests {
     }
 
     #[test]
-    fn identity_bound_websocket_keeps_custom_ca_scope() {
+    fn configured_ca_scope_does_not_load_platform_roots() {
         let (_, custom_ca_pem, custom_server) = test_ca_and_server_certificate();
         let (_, _, unrelated_server) = test_ca_and_server_certificate();
-        let expected = ExpectedNodeServerIdentity {
-            node_id: NodeId::new_v4(),
-            cluster_id: ClusterId::new_v4(),
-        };
-        let roots = websocket_root_certificates(Some(&custom_ca_pem), Some(expected), || {
-            panic!("an explicit node identity CA must not gain platform trust roots")
-        })
-        .unwrap();
+        let roots =
+            websocket_root_certificates(Some(&custom_ca_pem), RootTrustScope::ConfiguredCa, || {
+                panic!("an explicit direct CA must not gain platform trust roots")
+            })
+            .unwrap();
 
         assert_server_trust(&roots, &custom_server, "rendezvous.example", true);
         assert_server_trust(&roots, &unrelated_server, "rendezvous.example", false);
     }
 
     #[test]
+    fn direct_websocket_keeps_custom_ca_without_expected_identity() {
+        let (native_ca, _, native_server) = test_ca_and_server_certificate();
+        let (_, custom_ca_pem, custom_server) = test_ca_and_server_certificate();
+        let roots =
+            websocket_root_certificates(Some(&custom_ca_pem), RootTrustScope::ConfiguredCa, || {
+                native_certificates(vec![native_ca])
+            })
+            .unwrap();
+
+        assert_server_trust(&roots, &custom_server, "rendezvous.example", true);
+        assert_server_trust(&roots, &native_server, "rendezvous.example", false);
+    }
+
+    #[test]
     fn websocket_trusts_native_ca_without_custom_ca() {
         let (native_ca, _, server) = test_ca_and_server_certificate();
-        let roots =
-            websocket_root_certificates(None, None, || native_certificates(vec![native_ca]))
-                .unwrap();
+        let roots = websocket_root_certificates(None, RootTrustScope::ConfiguredCa, || {
+            native_certificates(vec![native_ca])
+        })
+        .unwrap();
 
         assert_server_trust(&roots, &server, "rendezvous.example", true);
     }
@@ -541,7 +629,7 @@ mod tests {
         let (_, custom_ca_pem, server) = test_ca_and_server_certificate();
         let roots = websocket_root_certificates(
             Some(&custom_ca_pem),
-            None,
+            RootTrustScope::PlatformAndConfiguredCa,
             native_certificate_loading_failure,
         )
         .unwrap();
@@ -551,8 +639,12 @@ mod tests {
 
     #[test]
     fn websocket_reports_native_loading_failure_without_custom_ca() {
-        let error = websocket_root_certificates(None, None, native_certificate_loading_failure)
-            .expect_err("an unavailable trust store must fail explicitly");
+        let error = websocket_root_certificates(
+            None,
+            RootTrustScope::ConfiguredCa,
+            native_certificate_loading_failure,
+        )
+        .expect_err("an unavailable trust store must fail explicitly");
 
         assert!(
             error
@@ -566,7 +658,7 @@ mod tests {
         let (native_ca, _, _) = test_ca_and_server_certificate();
         let result = websocket_root_certificates(
             Some("-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n"),
-            None,
+            RootTrustScope::PlatformAndConfiguredCa,
             || native_certificates(vec![native_ca]),
         );
 
@@ -580,9 +672,11 @@ mod tests {
     fn websocket_rejects_custom_ca_pem_without_certificates() {
         for pem in ["", "not a certificate"] {
             let (native_ca, _, _) = test_ca_and_server_certificate();
-            let error = websocket_root_certificates(Some(pem), None, || {
-                native_certificates(vec![native_ca])
-            })
+            let error = websocket_root_certificates(
+                Some(pem),
+                RootTrustScope::PlatformAndConfiguredCa,
+                || native_certificates(vec![native_ca]),
+            )
             .expect_err("an invalid explicit CA must not silently fall back to platform roots");
 
             assert!(
@@ -596,7 +690,7 @@ mod tests {
     #[test]
     fn websocket_uses_valid_native_roots_despite_unusable_entries() {
         let (native_ca, _, server) = test_ca_and_server_certificate();
-        let roots = websocket_root_certificates(None, None, || {
+        let roots = websocket_root_certificates(None, RootTrustScope::ConfiguredCa, || {
             native_certificates(vec![CertificateDer::from(vec![0, 1, 2]), native_ca])
         })
         .unwrap();
