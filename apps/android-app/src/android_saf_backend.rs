@@ -175,11 +175,12 @@ fn with_bridge_env<T>(
         .vm
         .attach_current_thread()
         .context("failed to attach SAF sync thread to JVM")?;
-    let class_ref = env
-        .new_local_ref(state.class.as_obj())
-        .context("failed to create local SAF bridge class ref")?;
-    let class = JClass::from(class_ref);
-    f(&mut env, class)
+    crate::java_exception_boundary::with_java_exception_boundary(&mut env, |env| {
+        let class_ref = env
+            .new_local_ref(state.class.as_obj())
+            .context("failed to create local SAF bridge class ref")?;
+        f(env, JClass::from(class_ref))
+    })
 }
 
 fn optional_tree_uri(options: &FolderAgentRuntimeOptions) -> Result<&str> {
@@ -190,7 +191,7 @@ fn optional_tree_uri(options: &FolderAgentRuntimeOptions) -> Result<&str> {
         .ok_or_else(|| anyhow::anyhow!("SAF runtime requires a non-empty local_tree_uri"))
 }
 
-fn list_tree_snapshot_json(tree_uri: &str) -> Result<String> {
+pub(super) fn list_tree_snapshot_json(tree_uri: &str) -> Result<String> {
     with_bridge_env(|env, class| {
         let j_tree_uri = env
             .new_string(tree_uri)

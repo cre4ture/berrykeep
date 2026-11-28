@@ -141,6 +141,7 @@ data class MainUiState(
     val status: String = "Ready",
     val objectBody: String = "",
     val syncProfiles: List<FolderSyncConfig> = emptyList(),
+    val folderAccessRequiredProfileIds: Set<String> = emptySet(),
     val folderSyncStatus: FolderSyncServiceStatus = FolderSyncServiceStatus(),
     val globalFolderSyncStatus: GlobalFolderSyncStatus = GlobalFolderSyncStatus(),
     val appConnectionStatus: AppConnectionStatus = AppConnectionStatus(),

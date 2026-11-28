@@ -9,6 +9,7 @@ import io.berrykeep.android.ui.screens.connectionRouteSnapshotsUiEquivalent
 internal data class FolderSyncPollResult(
     val folderSyncStatus: FolderSyncServiceStatus,
     val globalFolderSyncStatus: GlobalFolderSyncStatus,
+    val folderAccessRequiredProfileIds: Set<String> = emptySet(),
 )
 
 internal fun canApplyFolderSyncPollResult(
@@ -24,13 +25,15 @@ internal fun MainUiState.withFolderSyncPollResult(result: FolderSyncPollResult):
     val stableFolderSyncStatus = result.folderSyncStatus.withStableTimestampFrom(folderSyncStatus)
     if (
         folderSyncStatus == stableFolderSyncStatus &&
-        globalFolderSyncStatus == result.globalFolderSyncStatus
+        globalFolderSyncStatus == result.globalFolderSyncStatus &&
+        folderAccessRequiredProfileIds == result.folderAccessRequiredProfileIds
     ) {
         return this
     }
     return copy(
         folderSyncStatus = stableFolderSyncStatus,
         globalFolderSyncStatus = result.globalFolderSyncStatus,
+        folderAccessRequiredProfileIds = result.folderAccessRequiredProfileIds,
     )
 }
 

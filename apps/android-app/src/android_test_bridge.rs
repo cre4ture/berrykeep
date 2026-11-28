@@ -18,7 +18,7 @@ use common::ClusterId;
 use futures_util::{Sink, Stream};
 use jni::{
     JNIEnv,
-    objects::JClass,
+    objects::{JClass, JString},
     sys::{jboolean, jint, jstring},
 };
 use serde::Serialize;
@@ -41,6 +41,7 @@ use transport_sdk::{
 };
 
 const TEST_CLUSTER_ID: &str = "019d02eb-ab39-7220-911a-c0eafcb38249";
+
 const TEST_DOCUMENT_PATH: &str = "docs/readme.txt";
 const TEST_DOCUMENT_REQUEST_PATH: &str = "/api/v1/store/docs%2Freadme.txt";
 const TEST_DOCUMENT_SIZE_BYTES: usize = 1024 * 1024 + 17;
@@ -785,6 +786,39 @@ fn android_system_dns_server_count() -> Result<usize> {
     let (config, _) = hickory_resolver::system_conf::read_system_conf()
         .context("failed to read Android system DNS through the installed Iroh JNI context")?;
     Ok(config.name_servers().len())
+}
+
+/// # Safety
+/// This function is intended to be called from Java via JNI during instrumentation tests.
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_berrykeep_android_data_RustClientTestBridge_scanSafTreeAfterJavaException(
+    mut env: JNIEnv,
+    _class: JClass,
+    tree_uri: JString,
+) -> jstring {
+    let result = (|| -> Result<String> {
+        super::android_saf_backend::initialize_backend_bridge(&mut env)?;
+        let tree_uri: String = env.get_string(&tree_uri)?.into();
+        std::thread::spawn(move || -> Result<String> {
+            let error = super::android_saf_backend::list_tree_snapshot_json(&tree_uri)
+                .expect_err("the provider must reject the first scan");
+            let snapshot = super::android_saf_backend::list_tree_snapshot_json(&tree_uri)?;
+            Ok(
+                serde_json::json!({ "error": format!("{error:#}"), "snapshot": snapshot })
+                    .to_string(),
+            )
+        })
+        .join()
+        .map_err(|_| anyhow::anyhow!("SAF recovery test thread panicked"))?
+    })();
+    match result.and_then(|json| Ok(env.new_string(json)?.into_raw())) {
+        Ok(json) => json,
+        Err(error) => {
+            throw_java_error(&mut env, format!("SAF recovery test failed: {error:#}"));
+            std::ptr::null_mut()
+        }
+    }
 }
 
 /// # Safety

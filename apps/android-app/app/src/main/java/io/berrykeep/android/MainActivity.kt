@@ -160,6 +160,7 @@ class MainActivity : ComponentActivity() {
                 var lastSnackbarMessage by rememberSaveable { mutableStateOf("") }
                 var openWebUiWhenReady by rememberSaveable { mutableStateOf(false) }
                 var existingProfilePermissionRequestAttempted by rememberSaveable { mutableStateOf(false) }
+                var folderAccessProfileId by rememberSaveable { mutableStateOf<String?>(null) }
 
                 val scanLauncher = rememberLauncherForActivityResult(ScanContract()) { result ->
                     if (result.contents != null) {
@@ -214,6 +215,22 @@ class MainActivity : ComponentActivity() {
                         },
                         onError = vm::setStatus,
                     )
+                }
+                val folderAccessLauncher = rememberLauncherForActivityResult(
+                    ActivityResultContracts.StartActivityForResult(),
+                ) { result ->
+                    val profileId = folderAccessProfileId
+                    folderAccessProfileId = null
+                    if (profileId != null) {
+                        handleFolderPickerResult(
+                            context = context,
+                            result = result,
+                            onResolvedSelection = { path, uri ->
+                                vm.restoreFolderSyncProfileAccess(profileId, path, uri)
+                            },
+                            onError = vm::setStatus,
+                        )
+                    }
                 }
                 val diagnosticLogLauncher = rememberLauncherForActivityResult(
                     ActivityResultContracts.CreateDocument("text/plain"),
@@ -387,6 +404,18 @@ class MainActivity : ComponentActivity() {
                                     state = state.toSyncUiState(),
                                     actions = syncActions,
                                     onPickLocalFolder = onPickLocalFolder,
+                                    onGrantFolderAccess = { profileId ->
+                                        folderAccessProfileId = profileId
+                                        launchFolderPicker(
+                                            launcher = folderAccessLauncher,
+                                            onError = { message ->
+                                                folderAccessProfileId = null
+                                                vm.setStatus(message)
+                                            },
+                                            initialUri = state.syncProfiles.firstOrNull { it.id == profileId }
+                                                ?.localFolderTreeUri?.let(android.net.Uri::parse),
+                                        )
+                                    },
                                     onEnsureWifiNameAccess = onEnsureWifiNameAccess,
                                 )
 

@@ -65,6 +65,7 @@ private fun taskQueueEntry(id: String, label: String, pending: Long, active: Lon
 @Immutable
 data class SyncUiState(
     val profiles: List<FolderSyncConfig>,
+    val folderAccessRequiredProfileIds: Set<String>,
     val folderSyncStatus: FolderSyncServiceStatus,
     val globalFolderSyncStatus: GlobalFolderSyncStatus,
     val historyByProfileId: Map<String, FolderSyncHistoryState>,
@@ -82,6 +83,7 @@ data class SyncUiState(
 internal fun MainUiState.toSyncUiState(): SyncUiState =
     SyncUiState(
         profiles = syncProfiles,
+        folderAccessRequiredProfileIds = folderAccessRequiredProfileIds,
         folderSyncStatus = folderSyncStatus,
         globalFolderSyncStatus = globalFolderSyncStatus,
         historyByProfileId = folderSyncHistory,

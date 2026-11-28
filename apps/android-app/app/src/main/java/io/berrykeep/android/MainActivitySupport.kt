@@ -32,8 +32,10 @@ fun readAndroidSystemAccessState(context: Context): AndroidSystemAccessState {
 fun launchFolderPicker(
     launcher: ManagedActivityResultLauncher<Intent, ActivityResult>,
     onError: (String) -> Unit,
+    initialUri: Uri? = null,
 ) {
     val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
+        initialUri?.let { putExtra(DocumentsContract.EXTRA_INITIAL_URI, it) }
         addFlags(
             Intent.FLAG_GRANT_READ_URI_PERMISSION or
                 Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
@@ -134,7 +136,7 @@ fun handleFolderPickerResult(
     onError: (String) -> Unit,
 ) {
     val treeUri = result.data?.data
-    if (treeUri == null) {
+    if (result.resultCode != android.app.Activity.RESULT_OK || treeUri == null) {
         onError("Folder selection was cancelled")
         return
     }
@@ -144,6 +146,9 @@ fun handleFolderPickerResult(
         ?: (Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
     runCatching {
         context.contentResolver.takePersistableUriPermission(treeUri, grantFlags)
+    }.onFailure {
+        onError("Unable to retain folder access. Please select the folder again.")
+        return
     }
 
     val resolvedPath = resolveTreeUriToFilesystemPath(treeUri)

@@ -24,6 +24,18 @@ class RustSafBridgeInstrumentationTest {
     }
 
     @Test
+    fun nativeScanContainsSecurityExceptionAndCanScanAgainOnSameThread() {
+        TestTreeDocumentsProvider.seedFile(appContext, "hello.txt", "hello".toByteArray())
+        TestTreeDocumentsProvider.failNextChildQueryWithSecurityException()
+
+        val result = org.json.JSONObject(RustClientTestBridge.scanSafTreeAfterJavaException(treeUriString))
+
+        assertTrue(result.getString("error").contains("SecurityException"))
+        assertTrue(result.getString("error").contains("Injected revoked folder access"))
+        assertTrue(snapshotPaths(result.getString("snapshot")).contains("hello.txt"))
+    }
+
+    @Test
     fun listTreeSnapshot_andFileRoundTrip_workAgainstDocumentsProvider() {
         TestTreeDocumentsProvider.seedFile(appContext, "seed/hello.txt", "hello".toByteArray())
         TestTreeDocumentsProvider.seedFile(appContext, ".thumbnails/skip.jpg", byteArrayOf(1, 2, 3))

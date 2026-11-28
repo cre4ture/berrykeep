@@ -49,6 +49,9 @@ class TestTreeDocumentsProvider : DocumentsProvider() {
         projection: Array<out String>?,
         sortOrder: String?,
     ): Cursor {
+        if (failNextChildQuery.compareAndSet(true, false)) {
+            throw SecurityException("Injected revoked folder access")
+        }
         val result = MatrixCursor(resolveDocumentProjection(projection))
         val parentFile = fileForDocumentId(parentDocumentId)
         if (!parentFile.isDirectory) {
@@ -229,6 +232,11 @@ class TestTreeDocumentsProvider : DocumentsProvider() {
     }
 
     companion object {
+        private val failNextChildQuery = java.util.concurrent.atomic.AtomicBoolean(false)
+
+        fun failNextChildQueryWithSecurityException() {
+            failNextChildQuery.set(true)
+        }
         const val AUTHORITY = "io.berrykeep.android.test.documents"
         private const val ROOT_ID = "test-root"
         private const val ROOT_DOCUMENT_ID = "root"
@@ -243,6 +251,7 @@ class TestTreeDocumentsProvider : DocumentsProvider() {
             root.mkdirs()
             openCounts.clear()
             failNextRenameDisplayName.set(null)
+            failNextChildQuery.set(false)
         }
 
         fun seedFile(context: Context, relativePath: String, bytes: ByteArray) {

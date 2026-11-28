@@ -52,17 +52,17 @@ class FolderSyncWorker(
                 return@withContext Result.success()
             }
 
-            val networkDecisions = FolderSyncNetworkGate.evaluateProfiles(applicationContext, profiles)
-            val eligibleProfiles = networkDecisions
-                .filter { evaluation -> evaluation.decision.allowed }
+            val eligibilityDecisions = FolderSyncEligibilityGate.evaluateProfiles(applicationContext, profiles)
+            val eligibleProfiles = eligibilityDecisions
+                .filter { evaluation -> evaluation.allowed }
                 .map { evaluation -> evaluation.profile }
-            val skippedProfiles = networkDecisions
-                .filterNot { evaluation -> evaluation.decision.allowed }
+            val skippedProfiles = eligibilityDecisions
+                .filterNot { evaluation -> evaluation.allowed }
 
             skippedProfiles.forEach { evaluation ->
                 Log.i(
                     TAG,
-                    "skipping one-shot sync profile=${evaluation.profile.id} reason=${evaluation.decision.reason}",
+                    "skipping one-shot sync profile=${evaluation.profile.id} reason=${evaluation.reason}",
                 )
             }
 
@@ -70,8 +70,12 @@ class FolderSyncWorker(
                 // A WorkManager network constraint cannot express all per-profile policy (for
                 // example, disallowing roaming). Keep the persisted circuit armed without
                 // immediately running the same blocked attempt again.
-                rearmOutageRetry(deferDueAttempt = true)
-                Log.i(TAG, "one-shot sync skipped because no enabled profile matches the current network policy")
+                if (eligibilityDecisions.all { it.folderAccessRequired }) {
+                    FolderSyncOutageRetryScheduler.cancel(applicationContext)
+                } else {
+                    rearmOutageRetry(deferDueAttempt = true)
+                }
+                Log.i(TAG, "one-shot sync skipped because no enabled profile has folder access and an allowed network")
                 return@withContext Result.success()
             }
 

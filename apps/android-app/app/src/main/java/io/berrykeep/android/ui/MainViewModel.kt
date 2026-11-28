@@ -29,6 +29,7 @@ import io.berrykeep.android.data.EmbeddedWebUiSessionRegistry
 import io.berrykeep.android.data.PrivateWebServiceBrowserSession
 import io.berrykeep.android.data.DeviceIdentityStorageException
 import io.berrykeep.android.data.FolderSyncConfig
+import io.berrykeep.android.data.withRestoredFolderAccess
 import io.berrykeep.android.data.FolderSyncNetworkPolicy
 import io.berrykeep.android.data.GlobalFolderSyncStatus
 import io.berrykeep.android.data.FolderSyncServiceStatus
@@ -42,7 +43,7 @@ import io.berrykeep.android.data.TitleLatencyProbeStatus
 import io.berrykeep.android.data.parseAllowedWifiSsidsInput
 import io.berrykeep.android.ui.theme.normalizeBerryKeepAccentColorHex
 import io.berrykeep.android.work.FolderSyncScheduler
-import io.berrykeep.android.work.FolderSyncNetworkGate
+import io.berrykeep.android.work.FolderSyncEligibilityGate
 import io.berrykeep.android.work.FolderSyncExecutionCoordinator
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -1254,6 +1255,26 @@ class MainViewModel(
         persistFolderSyncProfiles(updated)
     }
 
+    fun restoreFolderSyncProfileAccess(profileId: String, path: String, treeUri: String) {
+        val profile = uiState.value.syncProfiles.firstOrNull { it.id == profileId } ?: return
+        val restored = runCatching { profile.withRestoredFolderAccess(path, treeUri) }
+            .getOrElse { error ->
+                setStatus(error.message ?: "Unable to restore folder access")
+                return
+            }
+        if (!FolderSyncEligibilityGate.hasFolderAccess(getApplication(), restored)) {
+            setStatus("Read and write folder access is required. Select the folder again.")
+            return
+        }
+        val updated = uiState.value.syncProfiles.map { if (it.id == profileId) restored else it }
+        uiState.value = uiState.value.copy(
+            syncProfiles = updated,
+            folderAccessRequiredProfileIds = uiState.value.folderAccessRequiredProfileIds - profileId,
+            status = "Folder access restored for '${profile.label}'",
+        )
+        persistFolderSyncProfiles(updated)
+    }
+
     fun removeFolderSyncProfile(profileId: String) {
         val updated = uiState.value.syncProfiles.filterNot { it.id == profileId }
         val updatedHistory = uiState.value.folderSyncHistory.toMutableMap().apply {
@@ -1300,11 +1321,11 @@ class MainViewModel(
             setStatus("No enabled sync profile is configured")
             return
         }
-        val eligibleProfiles = FolderSyncNetworkGate
+        val eligibleProfiles = FolderSyncEligibilityGate
             .evaluateProfiles(getApplication(), enabledProfiles)
-        val firstBlocked = eligibleProfiles.firstOrNull { evaluation -> !evaluation.decision.allowed }
-        if (eligibleProfiles.none { evaluation -> evaluation.decision.allowed }) {
-            val reason = firstBlocked?.decision?.reason ?: "No profile is allowed on the current network"
+        val firstBlocked = eligibleProfiles.firstOrNull { evaluation -> !evaluation.allowed }
+        if (eligibleProfiles.none { evaluation -> evaluation.allowed }) {
+            val reason = firstBlocked?.reason ?: "No profile is currently ready to sync"
             setStatus("Sync skipped: $reason")
             return
         }
@@ -1762,6 +1783,9 @@ class MainViewModel(
                         .getOrDefault(FolderSyncServiceStatus())
                     FolderSyncPollResult(
                         folderSyncStatus = status,
+                        folderAccessRequiredProfileIds = stateSnapshot.syncProfiles
+                            .filterNot { FolderSyncEligibilityGate.hasFolderAccess(getApplication(), it) }
+                            .mapTo(linkedSetOf()) { it.id },
                         globalFolderSyncStatus = buildGlobalFolderSyncStatus(
                             state = stateSnapshot,
                             runtimeStatus = status,
@@ -1866,9 +1890,9 @@ class MainViewModel(
         val enrollmentReady = state.deviceIdentity.isEnrolled
         val blockedProfiles = if (enrollmentReady) {
             runCatching {
-                FolderSyncNetworkGate
+                FolderSyncEligibilityGate
                     .evaluateProfiles(getApplication(), enabledProfiles)
-                    .filterNot { evaluation -> evaluation.decision.allowed }
+                    .filterNot { evaluation -> evaluation.allowed }
             }.getOrDefault(emptyList())
         } else {
             emptyList()
@@ -1879,7 +1903,7 @@ class MainViewModel(
             runtimeStatus = runtimeStatus,
             previousStatus = previousStatus,
             blockedProfileCount = blockedProfiles.size,
-            blockedReason = blockedProfiles.firstOrNull()?.decision?.reason,
+            blockedReason = blockedProfiles.firstOrNull()?.reason,
             enrollmentReady = enrollmentReady,
             oneShotRunning = execution.oneShotRunning,
             oneShotProfileLabel = execution.oneShotProfileLabel,
