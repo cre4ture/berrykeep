@@ -1551,27 +1551,40 @@ mod tests {
     }
 
     #[test]
-    fn managed_cli_client_starts_anonymous_bootstrap_with_offline_routes() {
+    fn managed_cli_client_starts_anonymous_bootstrap_without_foreground_probes() {
+        // Keep both endpoints bound but unanswered. A foreground quality probe
+        // would time out; checking the accept queues avoids a wall-clock limit
+        // on runtime and HTTP-client initialization under coverage instrumentation.
+        let listeners: Vec<_> = (0..2)
+            .map(|_| {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0")
+                    .expect("silent endpoint should bind");
+                listener
+                    .set_nonblocking(true)
+                    .expect("accept queue should be inspectable");
+                listener
+            })
+            .collect();
         let bootstrap = ConnectionBootstrap {
             version: 1,
             cluster_id: uuid::Uuid::now_v7(),
             rendezvous_urls: Vec::new(),
             rendezvous_contact_list: None,
             rendezvous_mtls_required: false,
-            direct_endpoints: vec![
-                transport_sdk::BootstrapEndpoint {
-                    url: "http://127.0.0.1:9".to_string(),
+            direct_endpoints: listeners
+                .iter()
+                .map(|listener| transport_sdk::BootstrapEndpoint {
+                    url: format!(
+                        "http://{}",
+                        listener
+                            .local_addr()
+                            .expect("silent endpoint has an address")
+                    ),
                     usage: Some(transport_sdk::BootstrapEndpointUse::PublicApi),
                     node_id: None,
                     node_hostname: None,
-                },
-                transport_sdk::BootstrapEndpoint {
-                    url: "http://127.0.0.1:10".to_string(),
-                    usage: Some(transport_sdk::BootstrapEndpointUse::PublicApi),
-                    node_id: None,
-                    node_hostname: None,
-                },
-            ],
+                })
+                .collect(),
             relay_mode: transport_sdk::RelayMode::Disabled,
             trust_roots: transport_sdk::BootstrapTrustRoots {
                 cluster_ca_pem: None,
@@ -1584,22 +1597,30 @@ mod tests {
             node_priority_overrides: std::collections::BTreeMap::new(),
         };
 
-        let started = std::time::Instant::now();
-        let (managed, _runtime) = build_managed_cli_client(
+        let (managed, runtime) = build_managed_cli_client(
             bootstrap,
             None,
             ManagedClientOptions {
                 initial_discovery_timeout: std::time::Duration::ZERO,
+                // Background maintenance is allowed to probe after startup;
+                // this test isolates construction of the foreground handle.
+                route_maintenance_policy: client_sdk::ClientRouteMaintenancePolicy {
+                    max_probe_concurrency: 0,
+                    ..client_sdk::ClientRouteMaintenancePolicy::default()
+                },
                 ..ManagedClientOptions::default()
             },
         )
         .expect("anonymous CLI client should retain offline bootstrap routes");
 
-        assert!(
-            started.elapsed() < std::time::Duration::from_millis(500),
-            "managed CLI startup should not wait for offline route probes"
-        );
         assert_eq!(managed.route_snapshot().endpoints.len(), 2);
+        runtime.shutdown();
+        for listener in listeners {
+            let error = listener
+                .accept()
+                .expect_err("managed CLI startup should not probe a bootstrap endpoint");
+            assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        }
     }
 
     async fn gateway_target_handler(
