@@ -751,10 +751,9 @@ mod tests {
             &[],
             UnixTime::now(),
         );
-        assert_eq!(
-            result.is_ok(),
-            trusted,
-            "unexpected server trust: {result:?}"
+        assert!(
+            result.is_ok() == trusted,
+            "unexpected server trust for {hostname}"
         );
     }
 
