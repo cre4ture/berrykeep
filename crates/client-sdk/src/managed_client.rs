@@ -1245,6 +1245,14 @@ mod tests {
 
     #[tokio::test]
     async fn managed_client_with_multiple_offline_routes_starts_without_quality_probes() {
+        // Unanswered endpoints make foreground quality probes fail instead of
+        // imposing a wall-clock limit on client construction. Authenticated
+        // background discovery may still fetch the cluster configuration.
+        let listeners: Vec<_> = (0..2)
+            .map(|_| {
+                std::net::TcpListener::bind("127.0.0.1:0").expect("silent endpoint should bind")
+            })
+            .collect();
         let cluster_id = Uuid::now_v7();
         let bootstrap = ConnectionBootstrap {
             version: 1,
@@ -1252,20 +1260,20 @@ mod tests {
             rendezvous_urls: Vec::new(),
             rendezvous_contact_list: None,
             rendezvous_mtls_required: false,
-            direct_endpoints: vec![
-                BootstrapEndpoint {
-                    url: "http://127.0.0.1:9".to_string(),
+            direct_endpoints: listeners
+                .iter()
+                .map(|listener| BootstrapEndpoint {
+                    url: format!(
+                        "http://{}",
+                        listener
+                            .local_addr()
+                            .expect("silent endpoint has an address")
+                    ),
                     usage: Some(BootstrapEndpointUse::PublicApi),
                     node_id: Some(NodeId::new_v4()),
                     node_hostname: None,
-                },
-                BootstrapEndpoint {
-                    url: "http://127.0.0.1:10".to_string(),
-                    usage: Some(BootstrapEndpointUse::PublicApi),
-                    node_id: Some(NodeId::new_v4()),
-                    node_hostname: None,
-                },
-            ],
+                })
+                .collect(),
             relay_mode: RelayMode::Disabled,
             trust_roots: BootstrapTrustRoots {
                 cluster_ca_pem: None,
@@ -1281,35 +1289,26 @@ mod tests {
             .expect("test identity should generate");
         identity.credential_pem = Some("issued-credential".to_string());
 
-        let managed = tokio::time::timeout(
-            Duration::from_millis(500),
-            bootstrap.build_managed_client_with_identity(
-                identity,
-                ManagedClientOptions {
-                    initial_discovery_timeout: Duration::ZERO,
-                    ..ManagedClientOptions::default()
-                },
-            ),
-        )
-        .await
-        .expect("managed client construction should not probe offline routes")
-        .expect("managed client should retain offline routes");
+        let options = ManagedClientOptions {
+            initial_discovery_timeout: Duration::ZERO,
+            // Isolate foreground construction from permitted background probes.
+            route_maintenance_policy: crate::ClientRouteMaintenancePolicy {
+                max_probe_concurrency: 0,
+                ..crate::ClientRouteMaintenancePolicy::default()
+            },
+            ..ManagedClientOptions::default()
+        };
+        let managed = bootstrap
+            .build_managed_client_with_identity(identity, options.clone())
+            .await
+            .expect("managed client should retain unanswered routes without probing");
 
         assert_eq!(managed.route_snapshot().endpoints.len(), 2);
 
-        let anonymous_managed = tokio::time::timeout(
-            Duration::from_millis(500),
-            bootstrap.build_managed_client(
-                None,
-                ManagedClientOptions {
-                    initial_discovery_timeout: Duration::ZERO,
-                    ..ManagedClientOptions::default()
-                },
-            ),
-        )
-        .await
-        .expect("anonymous managed client construction should not probe offline routes")
-        .expect("anonymous managed client should retain offline routes");
+        let anonymous_managed = bootstrap
+            .build_managed_client(None, options)
+            .await
+            .expect("anonymous managed client should retain unanswered routes without probing");
 
         assert_eq!(anonymous_managed.route_snapshot().endpoints.len(), 2);
     }
