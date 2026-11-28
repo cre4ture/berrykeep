@@ -394,17 +394,17 @@ class FolderSyncForegroundService : Service() {
                 return@withContext true
             }
 
-            val networkDecisions = FolderSyncNetworkGate.evaluateProfiles(applicationContext, profiles)
-            val allowedProfiles = networkDecisions
-                .filter { evaluation -> evaluation.decision.allowed }
+            val eligibilityDecisions = FolderSyncEligibilityGate.evaluateProfiles(applicationContext, profiles)
+            val allowedProfiles = eligibilityDecisions
+                .filter { evaluation -> evaluation.allowed }
                 .map { evaluation -> evaluation.profile }
-            val blockedProfiles = networkDecisions
-                .filterNot { evaluation -> evaluation.decision.allowed }
+            val blockedProfiles = eligibilityDecisions
+                .filterNot { evaluation -> evaluation.allowed }
 
             blockedProfiles.forEach { evaluation ->
                 Log.i(
                     TAG,
-                    "holding continuous sync profile=${evaluation.profile.id} reason=${evaluation.decision.reason}",
+                    "holding continuous sync profile=${evaluation.profile.id} reason=${evaluation.reason}",
                 )
             }
 
@@ -412,7 +412,7 @@ class FolderSyncForegroundService : Service() {
                 buildWaitingSummary(
                     blockedProfileCount = blockedProfiles.size,
                     profileLabel = evaluation.profile.label,
-                    reason = evaluation.decision.reason,
+                    reason = evaluation.reason,
                 )
             }
             hasAllowedProfiles = allowedProfiles.isNotEmpty()
@@ -437,8 +437,8 @@ class FolderSyncForegroundService : Service() {
             if (allowedProfiles.isEmpty()) {
                 cancelRetryWakeup()
                 updateNotification(
-                    "Waiting for allowed network",
-                    waitingSummary ?: "No enabled sync profile is allowed on the current network",
+                    "BerryKeep sync paused",
+                    waitingSummary ?: "No enabled sync profile is currently ready to sync",
                 )
             }
 
@@ -454,6 +454,7 @@ class FolderSyncForegroundService : Service() {
         statusJob = scope.launch {
             while (isActive) {
                 val snapshot = reconcileMutex.withLock {
+                    enforceEligibilityLocked()
                     val status = withContext(Dispatchers.IO) {
                         runCatching { repository.getContinuousFolderSyncStatus() }.getOrNull()
                     }
@@ -499,7 +500,7 @@ class FolderSyncForegroundService : Service() {
                 val activeProfileCount = status?.activeProfileCount ?: 0L
                 val (title, detail) = when {
                     !waitingMessage.isNullOrBlank() && !snapshot.hasAllowedProfiles && activeProfileCount == 0L -> {
-                        "Waiting for allowed network" to waitingMessage
+                        "BerryKeep sync paused" to waitingMessage
                     }
                     (status?.errorProfileCount ?: 0L) > 0L -> {
                         "BerryKeep sync paused" to buildRetryMessage(
@@ -646,7 +647,7 @@ class FolderSyncForegroundService : Service() {
         // gate before holding an automatic trigger so a previously cancelled outage wake-up is
         // re-armed as soon as such a profile becomes allowed.
         if (FolderSyncOutageRetryPolicy.requiresNetworkPolicyRefresh(trigger)) {
-            enforceNetworkPolicyLocked()
+            enforceEligibilityLocked()
         }
 
         val retryState = withContext(Dispatchers.IO) { outageRetryStore.state() }
@@ -772,19 +773,19 @@ class FolderSyncForegroundService : Service() {
     }
 
     /**
-     * Applies changed roaming, SSID, and transport permissions even when an endpoint circuit is
+     * Applies changed folder access, roaming, SSID, and transport permissions even when an endpoint circuit is
      * cooling down. It stops only newly disallowed profiles and does not issue network traffic.
      */
-    private suspend fun enforceNetworkPolicyLocked() {
+    private suspend fun enforceEligibilityLocked() {
         withContext(Dispatchers.IO) {
             val enabledProfiles = BerryKeepPreferences
                 .getFolderSyncConfigs(applicationContext)
                 .filter { profile -> profile.enabled }
-            val evaluations = FolderSyncNetworkGate.evaluateProfiles(applicationContext, enabledProfiles)
+            val evaluations = FolderSyncEligibilityGate.evaluateProfiles(applicationContext, enabledProfiles)
             val allowedProfiles = evaluations
-                .filter { evaluation -> evaluation.decision.allowed }
+                .filter { evaluation -> evaluation.allowed }
                 .map { evaluation -> evaluation.profile }
-            val blockedProfiles = evaluations.filterNot { evaluation -> evaluation.decision.allowed }
+            val blockedProfiles = evaluations.filterNot { evaluation -> evaluation.allowed }
 
             val newlyBlockedProfiles = blockedProfiles.filter { evaluation ->
                 evaluation.profile.id in lastDesiredProfileIds
@@ -793,7 +794,7 @@ class FolderSyncForegroundService : Service() {
                 repository.stopContinuousFolderSync(evaluation.profile.id)
                 Log.i(
                     TAG,
-                    "stopped continuous sync profile=${evaluation.profile.id} after network policy change: ${evaluation.decision.reason}",
+                    "stopped continuous sync profile=${evaluation.profile.id} after eligibility change: ${evaluation.reason}",
                 )
             }
             if (newlyBlockedProfiles.isNotEmpty()) {
@@ -809,7 +810,7 @@ class FolderSyncForegroundService : Service() {
                 buildWaitingSummary(
                     blockedProfileCount = blockedProfiles.size,
                     profileLabel = evaluation.profile.label,
-                    reason = evaluation.decision.reason,
+                    reason = evaluation.reason,
                 )
             }
             if (allowedProfiles.isEmpty()) {

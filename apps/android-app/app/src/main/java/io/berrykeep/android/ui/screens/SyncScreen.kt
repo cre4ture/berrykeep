@@ -62,6 +62,7 @@ fun SyncScreen(
     state: SyncUiState,
     actions: SyncScreenActions,
     onPickLocalFolder: () -> Unit,
+    onGrantFolderAccess: (String) -> Unit,
     onEnsureWifiNameAccess: (FolderSyncNetworkPolicy) -> Unit,
 ) {
     val profileStatuses = state.folderSyncStatus.profiles.associateBy { it.profileId }
@@ -144,6 +145,7 @@ fun SyncScreen(
         } else {
             state.profiles.forEach { profile ->
                 val profileStatus = profileStatuses[profile.id]
+                val folderAccessRequired = profile.id in state.folderAccessRequiredProfileIds
                 SectionCard(
                     title = profile.label,
                     supportingText = profile.localFolder,
@@ -152,7 +154,7 @@ fun SyncScreen(
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                         verticalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
-                        SyncBadge(if (profile.enabled) "Enabled" else "Paused")
+                        SyncBadge(if (folderAccessRequired || !profile.enabled) "Paused" else "Enabled")
                         SyncBadge(profile.prefix.ifBlank { "<root>" })
                         SyncBadge(folderSyncAllowedTransportLabel(profile.networkPolicy))
                         profileStatus?.phase
@@ -160,7 +162,9 @@ fun SyncScreen(
                             ?.let { phase -> SyncBadge(displayStatusToken(phase)) }
                     }
                     Text(
-                        text = profileStatus?.message ?: "Waiting for sync activity",
+                        text = if (folderAccessRequired) {
+                            "Folder access required. Grant access to the original folder to resume sync."
+                        } else profileStatus?.message ?: "Waiting for sync activity",
                         style = MaterialTheme.typography.bodyMedium,
                     )
                     Text(
@@ -188,6 +192,11 @@ fun SyncScreen(
                         }
                         OutlinedButton(onClick = { editingProfileId = profile.id }) {
                             Text(stringResource(R.string.edit))
+                        }
+                    }
+                    if (folderAccessRequired) {
+                        Button(onClick = { onGrantFolderAccess(profile.id) }) {
+                            Text("Grant folder access")
                         }
                     }
                 }

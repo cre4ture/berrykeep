@@ -11,6 +11,19 @@ import org.junit.Test
 
 class UiPollingStateTest {
     @Test
+    fun folderGrantChangesAreDisplayedEvenWhenNativeStatusHasNotChanged() {
+        val state = MainUiState()
+        val paused = state.withFolderSyncPollResult(FolderSyncPollResult(
+            state.folderSyncStatus, state.globalFolderSyncStatus, setOf("camera"),
+        ))
+        assertEquals(setOf("camera"), paused.toSyncUiState().folderAccessRequiredProfileIds)
+        val restored = paused.withFolderSyncPollResult(FolderSyncPollResult(
+            state.folderSyncStatus, state.globalFolderSyncStatus, emptySet(),
+        ))
+        assertEquals(emptySet<String>(), restored.folderAccessRequiredProfileIds)
+    }
+
+    @Test
     fun folderSyncPollTimestampAloneDoesNotCreateNewUiState() {
         val state = MainUiState(
             folderSyncStatus = FolderSyncServiceStatus(updatedUnixMs = 1_000L),

@@ -6,6 +6,9 @@ object RustClientTestBridge {
     }
 
     @JvmStatic
+    external fun scanSafTreeAfterJavaException(treeUri: String): String
+
+    @JvmStatic
     external fun getAndroidSystemDnsServerCount(): Int
 
     @JvmStatic

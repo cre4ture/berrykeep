@@ -3,6 +3,7 @@ mod android_context;
 mod android_saf_backend;
 #[cfg(debug_assertions)]
 mod android_test_bridge;
+mod java_exception_boundary;
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -902,11 +903,12 @@ fn with_android_preferences_env<T>(
         .vm
         .attach_current_thread()
         .context("failed to attach web UI thread to JVM")?;
-    let class_ref = env
-        .new_local_ref(state.class.as_obj())
-        .context("failed to create local RustPreferencesBridge class ref")?;
-    let class = JClass::from(class_ref);
-    f(&mut env, class)
+    java_exception_boundary::with_java_exception_boundary(&mut env, |env| {
+        let class_ref = env
+            .new_local_ref(state.class.as_obj())
+            .context("failed to create local RustPreferencesBridge class ref")?;
+        f(env, JClass::from(class_ref))
+    })
 }
 
 fn persist_android_connection_bootstrap(bootstrap: &ConnectionBootstrap) -> Result<()> {

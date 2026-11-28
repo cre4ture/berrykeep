@@ -11,6 +11,9 @@ This is the BerryKeep Android app.
 - Configure multiple folder-sync profiles (remote prefix <-> local folder)
 - Continuous foreground folder sync with a periodic WorkManager one-shot as a recovery fallback;
   manual "Sync Now" wakes the continuous run instead of starting a competing reconciliation
+- Missing Android folder grants pause only the affected SAF profiles. In **Sync**, use
+  **Grant folder access** and select the original folder to resume; cancelling or selecting a
+  different folder preserves the existing profile and its sync identity.
 - Optional Rust-backed title latency monitor with configurable period; compact `D` (direct) or `R` (relay) result in the app bar
 - App-bar diagnostic export that writes retained Android application events (including sanitized embedded WebView/JavaScript failures), current connection state, and Rust tracing output to a user-selected text file
 - Connection diagnostics and exports mark a route active only when its latest use has
@@ -75,6 +78,8 @@ In GitHub Actions, store the keystore itself as base64 in `BERRYKEEP_ANDROID_INT
 - Rust exports implemented in: `apps/android-app/src/lib.rs`
 - `BerryKeepApplication` initializes the process-wide Rust bridges with the
   Android application context before Iroh can construct its system DNS resolver.
+- Native SAF and preferences callbacks consume pending Java exceptions before detaching a
+  worker from the JVM, returning the Java error details through Rust instead of killing the app.
 - Native connection diagnostics feed a process-wide Kotlin `StateFlow`; the UI observes that
   in-memory source directly. Durable connection-status snapshots are conflated on an IO worker and
   flushed when the app moves to the background, rather than re-reading and rewriting JSON on every
