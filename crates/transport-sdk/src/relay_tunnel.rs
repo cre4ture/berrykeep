@@ -1,9 +1,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::{SinkExt, StreamExt};
 use reqwest::Url;
-use rustls::RootCertStore;
-use rustls::pki_types::pem::PemObject;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+use rustls::pki_types::ServerName;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
@@ -527,56 +525,8 @@ fn build_tls_client_config(
     server_ca_pem: Option<&str>,
     client_identity_pem: Option<&[u8]>,
 ) -> Result<rustls::ClientConfig> {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-
-    let mut roots = RootCertStore::empty();
-    if let Some(server_ca_pem) = server_ca_pem {
-        let mut reader = std::io::Cursor::new(server_ca_pem.as_bytes());
-        for cert in CertificateDer::pem_reader_iter(&mut reader) {
-            let cert = cert.context("failed parsing relay tunnel server CA certificate")?;
-            roots
-                .add(cert)
-                .context("failed adding relay tunnel server CA certificate")?;
-        }
-    } else {
-        let native = rustls_native_certs::load_native_certs();
-        for cert in native.certs {
-            roots
-                .add(cert)
-                .context("failed adding native relay tunnel root certificate")?;
-        }
-        if !native.errors.is_empty() && roots.is_empty() {
-            bail!("failed loading native root certificates for relay tunnel TLS");
-        }
-    }
-
-    let builder = rustls::ClientConfig::builder().with_root_certificates(roots);
-    match client_identity_pem {
-        Some(identity_pem) => {
-            let (cert_chain, key) = parse_client_identity_pem(identity_pem)?;
-            builder
-                .with_client_auth_cert(cert_chain, key)
-                .context("failed building relay tunnel TLS client identity")
-        }
-        None => Ok(builder.with_no_client_auth()),
-    }
-}
-
-fn parse_client_identity_pem(
-    identity_pem: &[u8],
-) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
-    let mut cert_reader = std::io::Cursor::new(identity_pem);
-    let cert_chain = CertificateDer::pem_reader_iter(&mut cert_reader)
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .context("failed parsing relay tunnel client certificate chain")?;
-    if cert_chain.is_empty() {
-        bail!("relay tunnel client identity PEM is missing a certificate chain");
-    }
-
-    let mut key_reader = std::io::Cursor::new(identity_pem);
-    let key = PrivateKeyDer::from_pem_reader(&mut key_reader)
-        .context("failed parsing relay tunnel client private key")?;
-    Ok((cert_chain, key))
+    crate::websocket_client::build_tls_client_config(server_ca_pem, client_identity_pem, None)
+        .context("failed building relay tunnel TLS client config")
 }
 
 #[cfg(test)]
@@ -606,6 +556,16 @@ mod tests {
         target: RelayTunnelClient,
         binary_frames: Arc<Mutex<Vec<Vec<u8>>>>,
         relay_task: JoinHandle<()>,
+    }
+
+    #[test]
+    fn relay_tunnel_rejects_custom_ca_pem_without_certificates() {
+        for pem in ["", "not a certificate"] {
+            assert!(
+                build_tls_client_config(Some(pem), None).is_err(),
+                "relay tunnel TLS must validate explicit CAs like the wake channel"
+            );
+        }
     }
 
     #[test]
