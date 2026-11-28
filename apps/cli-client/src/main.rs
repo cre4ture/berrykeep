@@ -1602,8 +1602,8 @@ mod tests {
             None,
             ManagedClientOptions {
                 initial_discovery_timeout: std::time::Duration::ZERO,
-                // Background maintenance is allowed to probe after startup;
-                // this test isolates construction of the foreground handle.
+                // Disable background health probes so this test isolates
+                // construction of the foreground handle.
                 route_maintenance_policy: client_sdk::ClientRouteMaintenancePolicy {
                     max_probe_concurrency: 0,
                     ..client_sdk::ClientRouteMaintenancePolicy::default()
