@@ -461,6 +461,9 @@ jobs:
       - name: Test TestFlight upload helper
         run: apps/apple-file-provider/scripts/test-upload-ios-testflight-ipa.sh
 
+      - name: Test iOS archive signing
+        run: python3 -m unittest discover -s apps/apple-file-provider/scripts -p test_ios_archive.py
+
       - name: Determine iOS signing mode
         run: |
           if [ -n "$BERRYKEEP_IOS_SIGNING_CERT_B64" ] && [ -n "$BERRYKEEP_IOS_SIGNING_CERT_PASSWORD" ] && [ -n "$BERRYKEEP_IOS_APP_PROFILE_B64" ] && [ -n "$BERRYKEEP_IOS_EXTENSION_PROFILE_B64" ]; then
@@ -593,33 +596,7 @@ jobs:
         if: ${{ github.event_name != 'pull_request' || env.IOS_RELEASE_REQUESTED == 'true' }}
         run: |
           rm -rf "$IOS_ARCHIVE_PATH" "$IOS_EXPORT_PATH"
-          if [ "$IOS_SIGNED_EXPORT_ENABLED" = "true" ]; then
-            xcodebuild archive \
-              -project "$IOS_PROJECT_PATH" \
-              -scheme "$IOS_APP_SCHEME" \
-              -configuration Release \
-              -destination "generic/platform=iOS" \
-              -derivedDataPath "$IOS_DERIVED_DATA_PATH" \
-              -archivePath "$IOS_ARCHIVE_PATH" \
-              CODE_SIGN_STYLE=Automatic \
-              CODE_SIGN_IDENTITY="$BERRYKEEP_IOS_SIGNING_IDENTITY" \
-              CODE_SIGNING_ALLOWED=YES \
-              CODE_SIGNING_REQUIRED=YES \
-              CURRENT_PROJECT_VERSION="$IOS_BUILD_NUMBER" \
-              DEVELOPMENT_TEAM="$BERRYKEEP_IOS_DEVELOPMENT_TEAM" \
-              OTHER_CODE_SIGN_FLAGS="--keychain $BERRYKEEP_IOS_KEYCHAIN_PATH"
-          else
-            xcodebuild archive \
-              -project "$IOS_PROJECT_PATH" \
-              -scheme "$IOS_APP_SCHEME" \
-              -configuration Release \
-              -destination "generic/platform=iOS" \
-              -derivedDataPath "$IOS_DERIVED_DATA_PATH" \
-              -archivePath "$IOS_ARCHIVE_PATH" \
-              CURRENT_PROJECT_VERSION="$IOS_BUILD_NUMBER" \
-              CODE_SIGNING_ALLOWED=NO \
-              CODE_SIGNING_REQUIRED=NO
-          fi
+          apps/apple-file-provider/scripts/archive-ios-app.sh
 
       - name: Verify archived iOS File Provider extension
         if: ${{ github.event_name != 'pull_request' || env.IOS_RELEASE_REQUESTED == 'true' }}

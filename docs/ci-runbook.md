@@ -319,6 +319,12 @@ The `ios-build` lane runs on `macos-latest` and covers:
   pull request labeled `ci:ios-release` (see
   [iOS release archive builds on pull requests](#ios-release-archive-builds-on-pull-requests))
 
+Signed archives use manual signing with the imported certificate and select
+the installed app and File Provider profiles separately by product name.
+`apps/apple-file-provider/scripts/archive-ios-app.sh` owns these archive
+settings; its tests also resolve the actual Xcode build settings without
+requiring signing credentials.
+
 The `BerryKeepIosProject` XCTest bundle is intentionally unhosted: it links only the shared Apple modules and no longer depends on launching `BerryKeepIosApp` in the simulator.
 
 Artifact behavior:
