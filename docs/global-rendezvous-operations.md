@@ -24,6 +24,12 @@ encrypted inner TLS stream, not application payloads or inner TLS termination.
 - [ ] Set `BERRYKEEP_RENDEZVOUS_GLOBAL_REGISTRATION_ENABLED=false` until the
   HTTPS endpoint, persistence, audit logging, and abuse controls are verified.
 
+Outbound rendezvous HTTP and WebSocket connections trust the platform roots plus
+any configured private rendezvous CA. This allows a node to use private LAN
+services and public CA-signed global services together while still checking each
+service's hostname or IP address. Direct connections bound to a stable node
+identity retain their explicit CA scope.
+
 ## Phase-2 configuration contract
 
 - [ ] `BERRYKEEP_RENDEZVOUS_GLOBAL_CLUSTER_REGISTRY` names the persistent

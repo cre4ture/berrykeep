@@ -155,26 +155,11 @@ pub fn build_tls_client_config(
 ) -> Result<rustls::ClientConfig> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let mut roots = RootCertStore::empty();
-    if let Some(server_ca_pem) = server_ca_pem {
-        let mut reader = std::io::Cursor::new(server_ca_pem.as_bytes());
-        for cert in CertificateDer::pem_reader_iter(&mut reader) {
-            let cert = cert.context("failed parsing websocket server CA certificate")?;
-            roots
-                .add(cert)
-                .context("failed adding websocket server CA certificate")?;
-        }
-    } else {
-        let native = rustls_native_certs::load_native_certs();
-        for cert in native.certs {
-            roots
-                .add(cert)
-                .context("failed adding native websocket root certificate")?;
-        }
-        if !native.errors.is_empty() && roots.is_empty() {
-            bail!("failed loading native root certificates for websocket TLS");
-        }
-    }
+    let roots = websocket_root_certificates(
+        server_ca_pem,
+        expected_server_identity,
+        rustls_native_certs::load_native_certs,
+    )?;
 
     let config = match expected_server_identity {
         Some(expected) => {
@@ -207,6 +192,37 @@ pub fn build_tls_client_config(
     };
 
     Ok(config)
+}
+
+fn websocket_root_certificates(
+    server_ca_pem: Option<&str>,
+    expected_server_identity: Option<ExpectedNodeServerIdentity>,
+    load_native_certs: impl FnOnce() -> rustls_native_certs::CertificateResult,
+) -> Result<RootCertStore> {
+    let mut roots = RootCertStore::empty();
+    if let Some(server_ca_pem) = server_ca_pem {
+        let mut reader = std::io::Cursor::new(server_ca_pem.as_bytes());
+        for cert in CertificateDer::pem_reader_iter(&mut reader) {
+            let cert = cert.context("failed parsing websocket server CA certificate")?;
+            roots
+                .add(cert)
+                .context("failed adding websocket server CA certificate")?;
+        }
+        if roots.is_empty() {
+            bail!("websocket server CA PEM contains no certificates");
+        }
+    }
+
+    // Locator-validated services can mix public and private CAs, just like HTTP.
+    // An explicit CA for stable node identity validation remains the trust boundary.
+    if server_ca_pem.is_none() || expected_server_identity.is_none() {
+        let native = load_native_certs();
+        let _ = roots.add_parsable_certificates(native.certs);
+        if roots.is_empty() {
+            bail!("failed loading native root certificates for websocket TLS");
+        }
+    }
+    Ok(roots)
 }
 
 fn expected_node_server_certificate_error(message: impl Into<String>) -> rustls::Error {
@@ -476,6 +492,177 @@ mod tests {
         KeyUsagePurpose, SanType,
     };
     use std::time::Instant;
+
+    #[test]
+    fn rendezvous_websocket_trusts_native_and_custom_cas() {
+        let (native_ca, _, native_server) = test_ca_and_server_certificate();
+        let (_, custom_ca_pem, custom_server) = test_ca_and_server_certificate();
+        let (_, _, untrusted_server) = test_ca_and_server_certificate();
+        let roots = websocket_root_certificates(Some(&custom_ca_pem), None, || {
+            native_certificates(vec![native_ca])
+        })
+        .unwrap();
+
+        assert_server_trust(&roots, &native_server, "rendezvous.example", true);
+        assert_server_trust(&roots, &custom_server, "rendezvous.example", true);
+        assert_server_trust(&roots, &untrusted_server, "rendezvous.example", false);
+        assert_server_trust(&roots, &native_server, "wrong-host.example", false);
+    }
+
+    #[test]
+    fn identity_bound_websocket_keeps_custom_ca_scope() {
+        let (_, custom_ca_pem, custom_server) = test_ca_and_server_certificate();
+        let (_, _, unrelated_server) = test_ca_and_server_certificate();
+        let expected = ExpectedNodeServerIdentity {
+            node_id: NodeId::new_v4(),
+            cluster_id: ClusterId::new_v4(),
+        };
+        let roots = websocket_root_certificates(Some(&custom_ca_pem), Some(expected), || {
+            panic!("an explicit node identity CA must not gain platform trust roots")
+        })
+        .unwrap();
+
+        assert_server_trust(&roots, &custom_server, "rendezvous.example", true);
+        assert_server_trust(&roots, &unrelated_server, "rendezvous.example", false);
+    }
+
+    #[test]
+    fn websocket_trusts_native_ca_without_custom_ca() {
+        let (native_ca, _, server) = test_ca_and_server_certificate();
+        let roots =
+            websocket_root_certificates(None, None, || native_certificates(vec![native_ca]))
+                .unwrap();
+
+        assert_server_trust(&roots, &server, "rendezvous.example", true);
+    }
+
+    #[test]
+    fn websocket_keeps_custom_ca_when_native_loading_fails() {
+        let (_, custom_ca_pem, server) = test_ca_and_server_certificate();
+        let roots = websocket_root_certificates(
+            Some(&custom_ca_pem),
+            None,
+            native_certificate_loading_failure,
+        )
+        .unwrap();
+
+        assert_server_trust(&roots, &server, "rendezvous.example", true);
+    }
+
+    #[test]
+    fn websocket_reports_native_loading_failure_without_custom_ca() {
+        let error = websocket_root_certificates(None, None, native_certificate_loading_failure)
+            .expect_err("an unavailable trust store must fail explicitly");
+
+        assert!(
+            error
+                .to_string()
+                .contains("failed loading native root certificates")
+        );
+    }
+
+    #[test]
+    fn websocket_rejects_invalid_custom_ca_even_with_native_roots() {
+        let (native_ca, _, _) = test_ca_and_server_certificate();
+        let result = websocket_root_certificates(
+            Some("-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n"),
+            None,
+            || native_certificates(vec![native_ca]),
+        );
+
+        assert!(
+            result.is_err(),
+            "invalid explicit trust material must be rejected"
+        );
+    }
+
+    #[test]
+    fn websocket_rejects_custom_ca_pem_without_certificates() {
+        for pem in ["", "not a certificate"] {
+            let (native_ca, _, _) = test_ca_and_server_certificate();
+            let error = websocket_root_certificates(Some(pem), None, || {
+                native_certificates(vec![native_ca])
+            })
+            .expect_err("an invalid explicit CA must not silently fall back to platform roots");
+
+            assert!(
+                error
+                    .to_string()
+                    .contains("CA PEM contains no certificates")
+            );
+        }
+    }
+
+    #[test]
+    fn websocket_uses_valid_native_roots_despite_unusable_entries() {
+        let (native_ca, _, server) = test_ca_and_server_certificate();
+        let roots = websocket_root_certificates(None, None, || {
+            native_certificates(vec![CertificateDer::from(vec![0, 1, 2]), native_ca])
+        })
+        .unwrap();
+
+        assert_server_trust(&roots, &server, "rendezvous.example", true);
+    }
+
+    fn native_certificates(
+        certs: Vec<CertificateDer<'static>>,
+    ) -> rustls_native_certs::CertificateResult {
+        let mut result = rustls_native_certs::CertificateResult::default();
+        result.certs = certs;
+        result
+    }
+
+    fn native_certificate_loading_failure() -> rustls_native_certs::CertificateResult {
+        let mut result = native_certificates(Vec::new());
+        result.errors.push(rustls_native_certs::Error {
+            context: "test native certificate store unavailable",
+            kind: rustls_native_certs::ErrorKind::Io {
+                inner: io::Error::new(io::ErrorKind::NotFound, "test trust store absent"),
+                path: "test-trust-store.pem".into(),
+            },
+        });
+        result
+    }
+
+    fn test_ca_and_server_certificate() -> (CertificateDer<'static>, String, CertificateDer<'static>)
+    {
+        let key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::new(Vec::new()).unwrap();
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca = params.self_signed(&key).unwrap();
+        let issuer = Issuer::from_params(&params, key);
+        let mut server_params =
+            CertificateParams::new(vec!["rendezvous.example".to_string()]).unwrap();
+        server_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        let server = server_params
+            .signed_by(&KeyPair::generate().unwrap(), &issuer)
+            .unwrap();
+        (ca.der().clone(), ca.pem(), server.der().clone())
+    }
+
+    fn assert_server_trust(
+        roots: &RootCertStore,
+        server: &CertificateDer<'_>,
+        hostname: &'static str,
+        trusted: bool,
+    ) {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let verifier = WebPkiServerVerifier::builder(Arc::new(roots.clone()))
+            .build()
+            .unwrap();
+        let result = verifier.verify_server_cert(
+            server,
+            &[],
+            &ServerName::try_from(hostname).unwrap(),
+            &[],
+            UnixTime::now(),
+        );
+        assert_eq!(
+            result.is_ok(),
+            trusted,
+            "unexpected server trust: {result:?}"
+        );
+    }
 
     #[tokio::test]
     async fn connect_websocket_times_out_for_unreachable_host() {
